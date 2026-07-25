@@ -17,6 +17,10 @@
  *                                     deploy code + flag observe-only first.
  *   ZB_FUTURE_RECONCILE_INTERVAL_MS   Tick cadence. Default 24h.
  *   ZB_FUTURE_RECONCILE_LOOKAHEAD_DAYS  Window from now to scan. Default 30.
+ *   ZB_FUTURE_RECONCILE_LOOKBACK_DAYS   Past window to also scan (catches
+ *                                       silent-cancelled recurring instances
+ *                                       whose scheduled_date has since drifted
+ *                                       into the past). Default 14.
  *   ZB_FUTURE_RECONCILE_PER_JOB_DELAY_MS  ZB pacing. Default 50ms.
  *
  * Concurrency:
@@ -49,6 +53,11 @@ const ENABLED = () => envFlag('ZB_FUTURE_RECONCILE_ENABLED');
 const APPLY = () => envFlag('ZB_FUTURE_RECONCILE_APPLY');
 const INTERVAL_MS = () => envInt('ZB_FUTURE_RECONCILE_INTERVAL_MS', 24 * 3600 * 1000);
 const LOOKAHEAD_DAYS = () => envInt('ZB_FUTURE_RECONCILE_LOOKAHEAD_DAYS', 30);
+const LOOKBACK_DAYS = () => {
+  // Allow 0 (opt-out) — envInt rejects 0 because it requires > 0. Read raw.
+  const raw = parseInt(process.env.ZB_FUTURE_RECONCILE_LOOKBACK_DAYS, 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 14;
+};
 const PER_JOB_DELAY_MS = () => {
   const v = parseInt(process.env.ZB_FUTURE_RECONCILE_PER_JOB_DELAY_MS, 10);
   return Number.isFinite(v) && v >= 0 ? v : 50;
@@ -114,6 +123,7 @@ async function runReconcileTick({ supabase, logger = console, updateJobStatusFn 
   try {
     const apply = APPLY();
     const lookaheadDays = LOOKAHEAD_DAYS();
+    const lookbackDays = LOOKBACK_DAYS();
     const perJobDelayMs = PER_JOB_DELAY_MS();
 
     const { data: users, error: usersErr } = await supabase
@@ -129,7 +139,7 @@ async function runReconcileTick({ supabase, logger = console, updateJobStatusFn 
     const tenants = (users || []).filter(u => u.zenbooker_api_key);
     logger.log(
       `[ZBFutureReconcileCron] tick starting — tenants=${tenants.length} apply=${apply} ` +
-      `lookahead=${lookaheadDays}d perJobDelayMs=${perJobDelayMs}`
+      `lookahead=${lookaheadDays}d lookback=${lookbackDays}d perJobDelayMs=${perJobDelayMs}`
     );
 
     const tickSummary = {
@@ -157,6 +167,7 @@ async function runReconcileTick({ supabase, logger = console, updateJobStatusFn 
           apiKey: tenant.zenbooker_api_key,
           dryRun: !apply,
           lookaheadDays,
+          lookbackDays,
           perJobDelayMs,
           logger,
           source: apply ? 'zb_future_reconcile_cron_apply' : 'zb_future_reconcile_cron_dryrun',
@@ -199,7 +210,7 @@ function startReconcileCron({ supabase, logger = console, updateJobStatusFn }) {
   const intervalMs = INTERVAL_MS();
   logger.log(
     `[ZBFutureReconcileCron] starting — interval=${intervalMs}ms apply=${APPLY()} ` +
-    `lookahead=${LOOKAHEAD_DAYS()}d`
+    `lookahead=${LOOKAHEAD_DAYS()}d lookback=${LOOKBACK_DAYS()}d`
   );
 
   let running = false;
@@ -234,4 +245,5 @@ module.exports = {
   zbFetch,
   ENABLED,
   APPLY,
+  LOOKBACK_DAYS,
 };

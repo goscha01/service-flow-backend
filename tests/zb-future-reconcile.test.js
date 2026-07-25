@@ -344,6 +344,73 @@ describe('reconcileFutureJobs', () => {
     return d.toISOString();
   }
 
+  function makePastDate(daysAgo) {
+    const d = new Date(Date.now() - daysAgo * 86400000);
+    return d.toISOString();
+  }
+
+  test('lookbackDays: catches a silent cancellation for a past-scheduled recurring instance', async () => {
+    // Repros the Angela Goldstein / Larisa Shumelda phantom-payout case:
+    // ZB cancelled the recurring instance weeks ago (no per-instance webhook),
+    // SF stayed `scheduled`, and the payroll "Include scheduled" flow flipped
+    // it to `completed` — paying a cleaner for work that never happened.
+    // Lookback lets the reconciler catch it before the payroll flow does.
+    const supabase = makeSupabase({
+      jobs: [
+        { id: 141974, user_id: 2, zenbooker_id: 'zb_angela_past', status: 'scheduled', scheduled_date: makePastDate(5) },
+        { id: 141975, user_id: 2, zenbooker_id: 'zb_open_future', status: 'scheduled', scheduled_date: makeFutureDate(7) },
+      ],
+    });
+    const updateJobStatusFn = jest.fn().mockResolvedValue({});
+    const zbFetchFn = jest.fn(async (apiKey, path) => {
+      if (path.endsWith('/zb_angela_past')) return { canceled: true };
+      return { canceled: false };
+    });
+
+    const { summary } = await reconcileFutureJobs({
+      supabase,
+      userId: 2,
+      apiKey: 'k',
+      dryRun: false,
+      lookaheadDays: 30,
+      lookbackDays: 14,
+      perJobDelayMs: 0,
+      logger: quietLogger(),
+      zbFetchFn,
+      updateJobStatusFn,
+    });
+
+    expect(summary.scanned).toBe(2);
+    expect(summary.updated_cancelled).toBe(1);
+    expect(updateJobStatusFn).toHaveBeenCalledTimes(1);
+    expect(updateJobStatusFn.mock.calls[0][1].jobId).toBe(141974);
+  });
+
+  test('default lookbackDays=0 preserves the original "future-only" behavior', async () => {
+    const supabase = makeSupabase({
+      jobs: [
+        { id: 141974, user_id: 2, zenbooker_id: 'zb_past', status: 'scheduled', scheduled_date: makePastDate(5) },
+      ],
+    });
+    const updateJobStatusFn = jest.fn().mockResolvedValue({});
+    const zbFetchFn = jest.fn().mockResolvedValue({ canceled: true });
+
+    const { summary } = await reconcileFutureJobs({
+      supabase,
+      userId: 2,
+      apiKey: 'k',
+      dryRun: false,
+      lookaheadDays: 30,
+      perJobDelayMs: 0,
+      logger: quietLogger(),
+      zbFetchFn,
+      updateJobStatusFn,
+    });
+
+    expect(summary.scanned).toBe(0);
+    expect(updateJobStatusFn).not.toHaveBeenCalled();
+  });
+
   test('catches a silent cancellation in the future window', async () => {
     const supabase = makeSupabase({
       jobs: [
