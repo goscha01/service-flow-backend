@@ -40287,9 +40287,17 @@ app.post('/api/ledger/cash-to-company', authenticateToken, async (req, res) => {
 // (Constitution §3.1), so a later cancel cannot claw it back — operator owns
 // that risk.
 async function completeScheduledJobsForMemberInPeriod(userId, teamMemberId, periodStart, periodEnd) {
-  const earningsStatuses = new Set(['completed', 'complete', 'paid']);
-  // Find candidate jobs in the window assigned to this member by EITHER
-  // the legacy direct column OR the join table.
+  // Only forward-in-progress statuses convert to completed here. Cancelled /
+  // rescheduled / no-show explicitly excluded — flipping them to completed
+  // resurrects work that didn't happen and creates a phantom earning row
+  // (see job 142070: cancelled 2026-06-20 → payout batch flipped back to
+  // completed → $95.40 phantom already-batched earning).
+  const PROJECTABLE_STATUSES = new Set([
+    'scheduled', 'pending', 'confirmed',
+    'in-progress', 'in_progress',
+    'en-route', 'en_route',
+    'started', 'late',
+  ]);
   const memberIdInt = parseInt(teamMemberId);
 
   // a) Direct assignment via jobs.team_member_id
@@ -40311,11 +40319,11 @@ async function completeScheduledJobsForMemberInPeriod(userId, teamMemberId, peri
     .lte('jobs.scheduled_date', `${periodEnd} 23:59:59`);
   const joinJobs = (joinRows || []).map(r => r.jobs).filter(Boolean);
 
-  // Dedupe by id and keep only non-earnings statuses
+  // Dedupe by id and keep only projectable statuses
   const byId = new Map();
   [...(directJobs || []), ...joinJobs].forEach(j => {
     if (!j || !j.id) return;
-    if (earningsStatuses.has((j.status || '').toLowerCase())) return;
+    if (!PROJECTABLE_STATUSES.has((j.status || '').toLowerCase())) return;
     byId.set(j.id, j);
   });
   const candidates = Array.from(byId.values());
