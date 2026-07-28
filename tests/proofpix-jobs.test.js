@@ -40,6 +40,7 @@ function makeFakeSupabase(seed = {}) {
     customer_files: [...(seed.customer_files || [])],
     proofpix_connections: [...(seed.proofpix_connections || [])],
     job_team_assignments: [...(seed.job_team_assignments || [])],
+    team_members: [...(seed.team_members || [])],
   };
   const rpcCalls = [];
 
@@ -396,12 +397,54 @@ describe('GET /jobs — shape and fields', () => {
     expect(res.body.jobs[0].scheduled_at).toBe(Date.parse('2026-07-15T09:00:00'));
   });
 
-  test('scheduled_at handles "YYYY-MM-DD HH:MM:SS" format in scheduled_date (ZB sync legacy data)', async () => {
+  test('scheduled_at prefers the time embedded in scheduled_date over scheduled_time (filler avoidance)', async () => {
+    // Live SF data (per prod audit 2026-07-28): scheduled_time is
+    // often a default '09:00:00' filler while the real appointment
+    // time lives embedded in scheduled_date as 'YYYY-MM-DD HH:MM:SS'.
+    // Prior mapper stripped the embedded time and used the filler,
+    // collapsing every job to 09:00 → sort ties. Fix: honor
+    // embedded time when present; fall back to scheduled_time only
+    // for bare 'YYYY-MM-DD' dates.
     const supa = makeFakeSupabase({
       users: [{ id: 1, business_name: 'A', email: 'a@b' }],
       proofpix_connections: [seedConnection(1)],
       jobs: [makeJob({
-        scheduled_date: '2026-05-16 09:00:00',   // not just YYYY-MM-DD
+        scheduled_date: '2026-05-16 14:30:00',   // embedded time is authoritative
+        scheduled_time: '09:00:00',              // filler — should NOT win
+      })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`)
+      .send();
+    expect(res.body.jobs[0].scheduled_at).toBe(Date.parse('2026-05-16T14:30:00'));
+  });
+
+  test('scheduled_at handles HH:MM (no seconds) embedded in scheduled_date', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [makeJob({
+        scheduled_date: '2026-05-16 15:00',    // ambiguous separator, no seconds
+        scheduled_time: '09:00:00',
+      })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`)
+      .send();
+    expect(res.body.jobs[0].scheduled_at).toBe(Date.parse('2026-05-16T15:00:00'));
+  });
+
+  test('scheduled_at falls back to scheduled_time for bare YYYY-MM-DD dates', async () => {
+    // Bare date (no embedded time) → scheduled_time is the source of truth.
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [makeJob({
+        scheduled_date: '2026-05-16',
         scheduled_time: '14:30:00',
       })],
     });
@@ -902,6 +945,80 @@ describe('GET /jobs — linked_sf_team_member scoping', () => {
       .set('Authorization', `Bearer ${accessTokenFor(1)}`);
     expect(res.status).toBe(200);
     expect(res.body.jobs).toEqual([]);
+  });
+
+  test('per-request ?team_member_id filters an admin-scope connection (proxy pattern)', async () => {
+    // Admin-scope connection (linked_sf_team_member_id null) — proxy
+    // adds ?team_member_id=X on each call to route to that cleaner
+    // without re-pairing.
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],   // no linked_sf_team_member_id
+      team_members: [{ id: 42, user_id: 1, first_name: 'Sarah', status: 'active' }],
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: null }),
+        makeJob({ id: 101, status: 'pending', team_member_id: 42 }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all&team_member_id=42')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id))).toEqual([101]);
+  });
+
+  test('per-request ?team_member_id must belong to caller workspace (400 for cross-tenant)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }, { id: 2, business_name: 'B', email: 'b@b' }],
+      proofpix_connections: [seedConnection(1)],
+      team_members: [{ id: 200, user_id: 2, first_name: 'Other', status: 'active' }],   // owned by user 2
+      jobs: [makeJob({ id: 100, status: 'pending', team_member_id: 200 })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?team_member_id=200')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_TEAM_MEMBER');
+  });
+
+  test('per-request ?team_member_id on scoped connection: mismatch → 403', async () => {
+    // Scoped-pair invariant — connection is pinned to Sarah (42);
+    // the proxy can't reroute to Mike (43) on this connection.
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      team_members: [
+        { id: 42, user_id: 1, first_name: 'Sarah', status: 'active' },
+        { id: 43, user_id: 1, first_name: 'Mike',  status: 'active' },
+      ],
+      jobs: [makeJob({ id: 100, status: 'pending', team_member_id: 43 })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?team_member_id=43')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  test('per-request ?team_member_id on scoped connection: match → OK (filters as usual)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      team_members: [{ id: 42, user_id: 1, first_name: 'Sarah', status: 'active' }],
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: 42 }),
+        makeJob({ id: 101, status: 'pending', team_member_id: null }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all&team_member_id=42')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id))).toEqual([100]);
   });
 
   test('team-member scope composes with status filter (only Sarah\'s active jobs)', async () => {

@@ -837,14 +837,30 @@ module.exports = (supabase, logger) => {
 
   function scheduledAtMs(j) {
     if (!j.scheduled_date) return null;
-    // scheduled_date is `text NOT NULL` in the schema, but the live data
-    // is mixed — some rows are 'YYYY-MM-DD' and others 'YYYY-MM-DD HH:MM:SS'
-    // (ZB sync historically wrote the latter). Take the date prefix and
-    // re-attach scheduled_time so we always get an unambiguous local
-    // timestamp string Date.parse can handle.
-    const dateOnly = String(j.scheduled_date).slice(0, 10);
+    // scheduled_date is `text NOT NULL` in the schema; live data is
+    // mixed — some rows are bare 'YYYY-MM-DD', others are
+    // 'YYYY-MM-DD HH:MM:SS' (ZB sync historically wrote the latter,
+    // and it's now the dominant shape for scheduled workflow).
+    // scheduled_time exists as a separate column but on production
+    // rows it's often a default filler ('09:00:00') that does NOT
+    // reflect the real appointment time — that lives embedded in
+    // scheduled_date.
+    //
+    // Rule: if scheduled_date carries an embedded time, use it
+    // verbatim. ONLY fall back to scheduled_time when the date is
+    // bare (no time component). This matches what SF web displays.
+    const raw = String(j.scheduled_date).trim();
+    const dateOnly = raw.slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateOnly)) return null;
-    const time = j.scheduled_time || '09:00:00';
+    const hasEmbeddedTime = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?/.test(raw);
+    let time;
+    if (hasEmbeddedTime) {
+      // Extract HH:MM[:SS] after the date part, normalize the separator.
+      const timePart = raw.slice(11).split(/[+.Z ]/)[0];
+      time = /^\d{2}:\d{2}$/.test(timePart) ? `${timePart}:00` : timePart;
+    } else {
+      time = j.scheduled_time || '09:00:00';
+    }
     const ms = Date.parse(`${dateOnly}T${time}`);
     return Number.isFinite(ms) ? ms : null;
   }
@@ -872,6 +888,37 @@ module.exports = (supabase, logger) => {
   router.get('/jobs', requireProofpixAccessToken, async (req, res) => {
     const userId = req.proofpix.userId;
     const linkedTeamMemberId = req.proofpix.linkedSfTeamMemberId;
+
+    // Per-request team-member scope: proxy pattern where a single
+    // admin-scoped connection serves multiple team members by passing
+    // ?team_member_id=<id> on each /jobs call. Distinct from
+    // linked_sf_team_member_id (which pins the entire connection at
+    // pair time). See the SF ↔ ProofPix follow-up thread — this is
+    // Option B for per-cleaner routing without re-pairing.
+    //
+    // Precedence + safety:
+    //   • Must belong to the caller's workspace (resolveForTeamMemberId
+    //     re-validates against team_members.user_id).
+    //   • If the connection is ALREADY scoped (linkedSfTeamMemberId
+    //     set), the request param must match — otherwise the scoped
+    //     pair's invariant would be violated. Mismatch → 403.
+    //   • If the connection is admin-scope, the query param wins.
+    let requestTeamMemberIdRaw = req.query.team_member_id;
+    if (Array.isArray(requestTeamMemberIdRaw)) requestTeamMemberIdRaw = requestTeamMemberIdRaw[0];
+    let effectiveTeamMemberId = linkedTeamMemberId;
+    if (requestTeamMemberIdRaw != null && requestTeamMemberIdRaw !== '') {
+      const forTM = await resolveForTeamMemberId(requestTeamMemberIdRaw, userId);
+      if (!forTM.ok) {
+        return res.status(forTM.status).json(errBody(forTM.code, forTM.message));
+      }
+      if (linkedTeamMemberId != null && linkedTeamMemberId !== forTM.teamMemberId) {
+        return res.status(403).json(errBody(
+          'FORBIDDEN',
+          'Connection is pinned to a different team member; drop the ?team_member_id query param or re-pair.'
+        ));
+      }
+      effectiveTeamMemberId = forTM.teamMemberId;
+    }
 
     // ── Parse + validate query params ───────────────────────────────
     const statusParam = (typeof req.query.status === 'string' && req.query.status)
@@ -921,21 +968,23 @@ module.exports = (supabase, logger) => {
       searchCustomerIds = (matched || []).map((c) => c.id);
     }
 
-    // ── Team-member scope: if this device is linked to a specific SF
-    //    team member (via /connect/*/issue's for_team_member_id), only
-    //    return jobs assigned to them. SF stores assignments in TWO
-    //    places (see server.js:3079-3106): jobs.team_member_id (legacy
-    //    single-assignee column) AND job_team_assignments (newer
-    //    multi-assignee join). Union of both = full picture.
+    // ── Team-member scope: if this call is targeting a specific SF
+    //    team member (via the pair's linked_sf_team_member_id OR the
+    //    per-request ?team_member_id override — precedence resolved
+    //    above into effectiveTeamMemberId), only return jobs
+    //    assigned to them. SF stores assignments in TWO places (see
+    //    server.js:3079-3106): jobs.team_member_id (legacy single-
+    //    assignee column) AND job_team_assignments (newer multi-
+    //    assignee join). Union of both = full picture.
     //
     //    Pull the assignment-table ids upfront so the final /jobs query
     //    stays a single filter chain (composes cleanly with search + cursor).
     let assignedJobIds = null;
-    if (linkedTeamMemberId != null) {
+    if (effectiveTeamMemberId != null) {
       const { data: assignments, error: assignErr } = await supabase
         .from('job_team_assignments')
         .select('job_id')
-        .eq('team_member_id', linkedTeamMemberId);
+        .eq('team_member_id', effectiveTeamMemberId);
       if (assignErr) {
         log.error('[ProofPix] /jobs assignments lookup failed:', assignErr.message);
         return res.status(500).json(errBody('INTERNAL', 'Assignment lookup failed.'));
@@ -959,8 +1008,8 @@ module.exports = (supabase, logger) => {
       .limit(limit + 1);   // +1 = peek for next page
 
     // Team-member scope filter — OR'd from two sources.
-    if (linkedTeamMemberId != null) {
-      const scopeOrs = [`team_member_id.eq.${linkedTeamMemberId}`];
+    if (effectiveTeamMemberId != null) {
+      const scopeOrs = [`team_member_id.eq.${effectiveTeamMemberId}`];
       if (assignedJobIds && assignedJobIds.length > 0) {
         scopeOrs.push(`id.in.(${assignedJobIds.join(',')})`);
       }
