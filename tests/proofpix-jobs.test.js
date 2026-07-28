@@ -308,7 +308,58 @@ describe('GET /jobs — shape and fields', () => {
       status: 'active',
       scheduled_at: Date.parse('2026-07-15T09:00:00'),
       photo_count: 2,
+      team_member_id: null,
+      team_member_ids: [],
     });
+  });
+
+  test('team_member_id + team_member_ids populate from jobs.team_member_id and job_team_assignments', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 100, team_member_id: 42 }),                    // primary only
+        makeJob({ id: 101, team_member_id: null }),                  // no primary, only via join
+        makeJob({ id: 102, team_member_id: 42 }),                    // primary + co-assignees
+        makeJob({ id: 103, team_member_id: null }),                  // completely unassigned
+      ],
+      job_team_assignments: [
+        { id: 1, job_id: 101, team_member_id: 43, is_primary: true },
+        { id: 2, job_id: 102, team_member_id: 44, is_primary: false },
+        { id: 3, job_id: 102, team_member_id: 45, is_primary: false },
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const byId = new Map(res.body.jobs.map((j) => [Number(j.id), j]));
+    expect(byId.get(100)).toMatchObject({ team_member_id: 42, team_member_ids: [] });
+    expect(byId.get(101)).toMatchObject({ team_member_id: null, team_member_ids: [43] });
+    expect(byId.get(102)).toMatchObject({
+      team_member_id: 42,
+      team_member_ids: expect.arrayContaining([44, 45]),
+    });
+    expect(byId.get(102).team_member_ids).toHaveLength(2);
+    expect(byId.get(103)).toMatchObject({ team_member_id: null, team_member_ids: [] });
+  });
+
+  test('team_member_ids dedupes if the same member appears twice in job_team_assignments', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [makeJob({ id: 100, team_member_id: null })],
+      job_team_assignments: [
+        { id: 1, job_id: 100, team_member_id: 42, is_primary: true },
+        { id: 2, job_id: 100, team_member_id: 42, is_primary: false },  // duplicate — should dedupe
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.body.jobs[0].team_member_ids).toEqual([42]);
   });
 
   test('title falls back to Job #<id> when service_name is null/empty', async () => {

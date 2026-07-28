@@ -1036,6 +1036,7 @@ module.exports = (supabase, logger) => {
       .select(`
         id, status, service_name,
         scheduled_date, scheduled_time, created_at,
+        team_member_id,
         service_address_street, service_address_city,
         service_address_state, service_address_zip,
         customers!left ( first_name, last_name )
@@ -1109,9 +1110,43 @@ module.exports = (supabase, logger) => {
     const hasMore  = (rows || []).length > limit;
     const nextCursor = hasMore ? encodeCursor(pageRows[pageRows.length - 1]) : null;
 
+    // ── Multi-assignee lookup for the page: batch-fetch every
+    //    job_team_assignments row whose job_id is on this page. Used
+    //    to populate the per-job team_member_ids[] response field so
+    //    the ProofPix admin's Team Projects tab can filter client-
+    //    side without extra roundtrips. Distinct from the earlier
+    //    assignments query (line ~985) which pulled ids for a SINGLE
+    //    team member to build the scope filter — this one pulls all
+    //    assignees for the returned page's jobs.
+    const jobIds = pageRows.map((r) => r.id);
+    const teamMemberIdsByJobId = new Map();
+    if (jobIds.length > 0) {
+      const { data: assignRows, error: assignErr } = await supabase
+        .from('job_team_assignments')
+        .select('job_id, team_member_id')
+        .in('job_id', jobIds);
+      if (assignErr) {
+        // Non-fatal — team_member_ids becomes [] for every row.
+        // ProofPix's Team Projects filter degrades to "primary
+        // assignee only" (jobs.team_member_id, still returned).
+        log.warn('[ProofPix] /jobs assignments batch lookup failed:', assignErr.message);
+      } else {
+        for (const row of assignRows || []) {
+          const jid = Number(row.job_id);
+          const tmid = Number(row.team_member_id);
+          if (!Number.isFinite(jid) || !Number.isFinite(tmid)) continue;
+          const list = teamMemberIdsByJobId.get(jid);
+          if (list) {
+            if (!list.includes(tmid)) list.push(tmid);
+          } else {
+            teamMemberIdsByJobId.set(jid, [tmid]);
+          }
+        }
+      }
+    }
+
     // ── Photo counts via the SQL helper (single round-trip, dodges
     //    1000-row default limit on customer_files.) ────────────────
-    const jobIds = pageRows.map((r) => r.id);
     const countsByJobId = {};
     if (jobIds.length > 0) {
       const { data: counts, error: countErr } = await supabase
@@ -1139,6 +1174,13 @@ module.exports = (supabase, logger) => {
       status: bucketStatus(j.status),
       scheduled_at: scheduledAtMs(j),
       photo_count: countsByJobId[j.id] || 0,
+      // Primary assignee — jobs.team_member_id (legacy single-
+      // assignee column). Null when unassigned. Distinct from
+      // team_member_ids below, which is the multi-assignee join.
+      team_member_id: j.team_member_id != null ? Number(j.team_member_id) : null,
+      // All assignees via job_team_assignments (may be empty even
+      // when team_member_id is set — the two aren't synced).
+      team_member_ids: teamMemberIdsByJobId.get(Number(j.id)) || [],
     }));
 
     return res.status(200).json({ jobs, next_cursor: nextCursor });
