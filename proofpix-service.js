@@ -877,7 +877,12 @@ module.exports = (supabase, logger) => {
     const statusParam = (typeof req.query.status === 'string' && req.query.status)
       ? req.query.status
       : 'active';
-    if (!['active', 'all', 'completed', 'cancelled', 'scheduled'].includes(statusParam)) {
+    // 'open' = active ∪ scheduled — the "everything not done" bucket
+    // that matches SF web's default job list (which shows scheduled
+    // jobs alongside active work). Without this, /jobs?status=active
+    // undercounts vs the SF web view whenever the workspace has
+    // scheduled-but-not-yet-active jobs.
+    if (!['active', 'all', 'completed', 'cancelled', 'scheduled', 'open'].includes(statusParam)) {
       return res.status(400).json(errBody('INVALID_PAYLOAD', 'Unknown status filter.'));
     }
 
@@ -968,6 +973,9 @@ module.exports = (supabase, logger) => {
     // Status filter
     if (statusParam === 'active') {
       query = query.in('status', ACTIVE_SF_STATUSES);
+    } else if (statusParam === 'open') {
+      // active ∪ scheduled — the "everything not done" SF-web default.
+      query = query.in('status', [...ACTIVE_SF_STATUSES, 'scheduled']);
     } else if (statusParam === 'completed') {
       query = query.in('status', ['completed', 'complete', 'paid']);
     } else if (statusParam === 'cancelled') {

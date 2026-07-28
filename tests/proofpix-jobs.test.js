@@ -529,6 +529,25 @@ describe('GET /jobs — status mapping + filter', () => {
     expect(buckets).toEqual(new Set(['active', 'completed', 'cancelled', 'scheduled']));
   });
 
+  test('?status=open returns active ∪ scheduled (matches SF web default list)', async () => {
+    const app = makeApp(mixedSupa());
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=open&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`)
+      .send();
+    // 7 active (pending, confirmed, in-progress, rescheduled, en-route,
+    // started, late) + 1 scheduled = 8. No completed/complete/paid/cancelled.
+    expect(res.body.jobs).toHaveLength(8);
+    const buckets = new Set(res.body.jobs.map((j) => j.status));
+    expect(buckets).toEqual(new Set(['active', 'scheduled']));
+    // Explicit sanity: ids 4/5/6/7 (completed/complete/paid/cancelled) excluded.
+    const ids = res.body.jobs.map((j) => Number(j.id));
+    expect(ids).not.toContain(4);
+    expect(ids).not.toContain(5);
+    expect(ids).not.toContain(6);
+    expect(ids).not.toContain(7);
+  });
+
   test('?status=junk → 400 INVALID_PAYLOAD', async () => {
     const app = makeApp(mixedSupa());
     const res = await request(app)
