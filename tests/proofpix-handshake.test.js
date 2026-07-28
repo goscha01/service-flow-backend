@@ -1361,6 +1361,80 @@ describe('proofpix-service — for_team_member_id (linked SF team member)', () =
 // Auth: ProofPix access token (from /connect/refresh via the proxy).
 // ─────────────────────────────────────────────────────────────────────
 
+describe('proofpix-service — GET /sf-team-members (invite-flow picker)', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('no access token → 401', async () => {
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    const res = await request(app).get('/api/integrations/proofpix/sf-team-members');
+    expect(res.status).toBe(401);
+  });
+
+  test('SF user JWT (wrong audience) → 401', async () => {
+    const app = makeApp(makeFakeSupabase({
+      users: [seedUser(1)],
+      proofpix_connections: [seedProofpixConnection(1)],
+    }));
+    const res = await request(app)
+      .get('/api/integrations/proofpix/sf-team-members')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(res.status).toBe(401);
+  });
+
+  test('happy path: returns active team members for workspace, no cross-tenant leak, active-only', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1), seedUser(2)],
+      proofpix_connections: [seedProofpixConnection(1)],
+      team_members: [
+        { id: 10, user_id: 1, first_name: 'Sarah',  last_name: 'K', email: 's@ex.com',  role: 'worker',  status: 'active' },
+        { id: 11, user_id: 1, first_name: 'Mike',   last_name: 'R', email: 'm@ex.com',  role: 'worker',  status: 'active' },
+        { id: 12, user_id: 1, first_name: 'Zoe',    last_name: 'L', email: 'z@ex.com',  role: 'admin',   status: 'inactive' }, // filtered
+        { id: 13, user_id: 2, first_name: 'Other',  last_name: 'X', email: 'o@ex.com',  role: 'worker',  status: 'active' },   // cross-tenant, filtered
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/sf-team-members')
+      .set('Authorization', `Bearer ${proofpixAccessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.team_members).toHaveLength(2);
+    // Sorted by first_name asc
+    expect(res.body.team_members[0]).toEqual({
+      id: 11, first_name: 'Mike', last_name: 'R', email: 'm@ex.com', role: 'worker', status: 'active',
+    });
+    expect(res.body.team_members[1]).toEqual({
+      id: 10, first_name: 'Sarah', last_name: 'K', email: 's@ex.com', role: 'worker', status: 'active',
+    });
+  });
+
+  test('empty when workspace has no active team members', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      proofpix_connections: [seedProofpixConnection(1)],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/sf-team-members')
+      .set('Authorization', `Bearer ${proofpixAccessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ team_members: [] });
+  });
+
+  test('flag-off namespace still 404s', async () => {
+    delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED];
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      proofpix_connections: [seedProofpixConnection(1)],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/sf-team-members')
+      .set('Authorization', `Bearer ${proofpixAccessTokenFor(1)}`);
+    expect(res.status).toBe(404);
+  });
+});
+
 describe('proofpix-service — POST /team-members (proxy → SF)', () => {
   beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
   afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });

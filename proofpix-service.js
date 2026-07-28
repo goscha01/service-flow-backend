@@ -12,6 +12,7 @@
  *   - DELETE /connections/:id             (SF user JWT — admin revoke of a specific device)
  *   - GET  /connection/status             (ProofPix access token)
  *   - DELETE /connection                  (ProofPix access token; idempotent)
+ *   - GET  /sf-team-members               (ProofPix access token — SF's own team_members list for invite-flow picker)
  *
  * PR 2 — jobs list:
  *   - GET /jobs                           (ProofPix access token)
@@ -774,6 +775,43 @@ module.exports = (supabase, logger) => {
       valid: true,
       workspace_id: workspace.workspace_id,
       workspace_name: workspace.workspace_name,
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // GET /sf-team-members
+  //   Lists the SF workspace's own team members (from the SF-native
+  //   team_members table — NOT the ProofPix shadow proofpix_team_members).
+  //   Used by ProofPix admin's invite flow to pick which SF cleaner
+  //   an outgoing invite maps to, so the invite carries an
+  //   sf_team_member_id from birth and downstream /jobs?team_member_id=
+  //   routing works without a separate link step.
+  //
+  //   Auth: ProofPix access token — same envelope as /jobs. Scoped
+  //   to req.proofpix.userId (the workspace owner). Active members
+  //   only. No pagination — workspaces are ≤ tens of members.
+  // ═════════════════════════════════════════════════════════════════
+  router.get('/sf-team-members', requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+    const { data, error } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, email, role, status')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('first_name', { ascending: true });
+    if (error) {
+      log.error('[ProofPix] /sf-team-members lookup failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Team member lookup failed.'));
+    }
+    return res.status(200).json({
+      team_members: (data || []).map((m) => ({
+        id: m.id,
+        first_name: m.first_name,
+        last_name: m.last_name,
+        email: m.email,
+        role: m.role,
+        status: m.status,
+      })),
     });
   });
 
