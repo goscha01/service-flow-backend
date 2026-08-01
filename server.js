@@ -40224,6 +40224,21 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
       await supabase.from('cleaner_ledger').insert(entries);
     }
 
+    // Backfill missing earning/tip/incentive rows. Cash edit is a strong
+    // signal the job is real, but if the completion/payment path never
+    // created earnings (late assignment sync, failed webhook, older manual
+    // cash entry made before earnings existed), the cash offset would stand
+    // alone and inflate the cleaner's debt. createLedgerEntriesForCompletedJob
+    // is idempotent on unbatched earning/tip/incentive — no-ops if present.
+    // Skip cash_collected for every assigned member so the rows we just
+    // wrote aren't duplicated.
+    try {
+      const skipCashPairs = new Set(allMemberIds.map(id => `${id}:cash_collected`));
+      await createLedgerEntriesForCompletedJob(jobId, userId, { skipMemberTypePairs: skipCashPairs });
+    } catch (e) {
+      console.error(`[Cash] earnings backfill after cash edit failed for job ${jobId}:`, e);
+    }
+
     res.json({ success: true, preserved_settled_rows: batchedCash.length });
   } catch (error) {
     console.error('Update cash collected error:', error);
