@@ -38738,7 +38738,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
   teamMembers.forEach(m => memberIdsForCount.add(m.id));
   if (job.team_member_id) memberIdsForCount.add(job.team_member_id);
   const memberCount = memberIdsForCount.size;
-  const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
+  const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : getTodayString();
 
   // Late-addition handling for tip/incentive: if a member already has any
   // settled (paid-out) row for this job, the original pay period is closed.
@@ -38752,7 +38752,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
     .eq('job_id', jobId)
     .not('payout_batch_id', 'is', null);
   const settledMembersForJob = new Set((jobSettledRows || []).map(r => r.team_member_id));
-  const todayDate = new Date().toISOString().split('T')[0];
+  const todayDate = getTodayString();
   const lateEffectiveDateFor = (memberId) =>
     settledMembersForJob.has(memberId) ? todayDate : effectiveDate;
 
@@ -39176,7 +39176,7 @@ async function syncJobIncentiveLedger(jobId, userId) {
     .eq('job_id', jobId)
     .not('payout_batch_id', 'is', null);
   const settledMembers = new Set((settledRows || []).map(r => r.team_member_id));
-  const today = new Date().toISOString().split('T')[0];
+  const today = getTodayString();
   const jobDate = job.scheduled_date
     ? String(job.scheduled_date).split('T')[0].split(' ')[0]
     : today;
@@ -39330,7 +39330,7 @@ async function rebuildJobLedger(jobId, userId, { types = LEDGER_COMPLETION_DERIV
   //    The earlier heuristic ("any batched entry exists for this job") was too
   //    aggressive: it jumped tips past a pending batch whose period the tip
   //    rightfully belonged to.
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = getTodayString();
   const { data: postRebuildEntries } = await supabase
     .from('cleaner_ledger')
     .select('id, team_member_id, type, payout_batch_id, effective_date')
@@ -40030,7 +40030,7 @@ app.post('/api/ledger/adjustment', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Amount must be a non-zero number' });
     }
 
-    const effectiveDate = new Date().toISOString().split('T')[0];
+    const effectiveDate = getTodayString();
 
     const { data: entry, error } = await supabase
       .from('cleaner_ledger')
@@ -40082,7 +40082,7 @@ app.post('/api/ledger/adjust-and-rebuild-batch', authenticateToken, async (req, 
     const teamMemberId = batch.team_member_id;
     const periodStart = batch.period_start;
     // Extend period to include today so the adjustment is captured
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getTodayString();
     const periodEnd = batch.period_end < todayStr ? todayStr : batch.period_end;
 
     // 2. Create the adjustment entry
@@ -40136,7 +40136,7 @@ app.post('/api/ledger/cash-collected', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Amount must be a positive number' });
     }
 
-    const effectiveDate = new Date().toISOString().split('T')[0];
+    const effectiveDate = getTodayString();
 
     const { data: entry, error } = await supabase
       .from('cleaner_ledger')
@@ -40181,7 +40181,7 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
     if (!job) return res.status(404).json({ error: 'Job not found' });
 
     const parsedAmount = Math.abs(parseFloat(amount));
-    const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
+    const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : getTodayString();
 
     // Get total cash for this job from transactions (case-insensitive — ZB may store 'Cash')
     const { data: cashTxs } = await supabase.from('transactions')
@@ -40284,7 +40284,7 @@ app.post('/api/ledger/cash-to-company', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Amount must be a positive number' });
     }
 
-    const effectiveDate = new Date().toISOString().split('T')[0];
+    const effectiveDate = getTodayString();
 
     const { data: entry, error } = await supabase
       .from('cleaner_ledger')
