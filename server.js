@@ -38943,7 +38943,30 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
     .eq('job_id', jobId)
     .eq('status', 'completed')
     .ilike('payment_method', 'cash');
+
+  // Skip cash creation entirely if any unbatched cash_collected row already
+  // exists for this job. Two reasons:
+  //   1. Respect the operator's manual attribution — the payroll PATCH
+  //      cash-edit endpoint rewrites cash rows to reflect who actually
+  //      pocketed the money (e.g. all $179 to one cleaner even though two
+  //      were assigned). Regenerating the even split here would clobber that.
+  //   2. Avoid a 23505 collision on idx_cleaner_ledger_job_member_type.
+  //      supabase.insert(array) aborts the WHOLE batch on any conflict, so a
+  //      single duplicate cash row would leave the earnings uncreated too —
+  //      exactly what caused job 142329 to lose its rebuilt earnings on every
+  //      payroll page load.
+  let existingCashPresent = false;
   if (cashTxs && cashTxs.length > 0) {
+    const { data: existingCash } = await supabase.from('cleaner_ledger')
+      .select('id')
+      .eq('job_id', jobId)
+      .eq('type', 'cash_collected')
+      .is('payout_batch_id', null)
+      .limit(1);
+    existingCashPresent = !!(existingCash && existingCash.length > 0);
+  }
+
+  if (!existingCashPresent && cashTxs && cashTxs.length > 0) {
     const totalCash = cashTxs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
     if (totalCash > 0) {
       // Split cash among assigned members (whoever collected it)
