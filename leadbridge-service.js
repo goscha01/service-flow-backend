@@ -48,6 +48,7 @@ const { makeOrchestrationAuthDispatcher } = require('./lib/lb-orchestration-auth
 const {
   makeAvailabilityHandler,
   makeBusyHandler,
+  makeLocationsHandler,
   makeBookingRequestHandler,
   makeBookingCancelHandler,
   makeHandoffHandler,
@@ -1691,6 +1692,7 @@ module.exports = (supabase, logger) => {
   const orchBusyHandler = makeBusyHandler({
     supabase, logger, resolveLocationForOrchestrationScope,
   })
+  const orchLocationsHandler = makeLocationsHandler({ supabase, logger })
   const orchBookingRequestHandler = makeBookingRequestHandler({
     supabase, logger, setCustomerAcquisitionIfMissing: _setCustomerAcquisitionIfMissing2B,
   })
@@ -1709,6 +1711,8 @@ module.exports = (supabase, logger) => {
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchAvailabilityHandler)
   router.get('/orchestration/busy',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBusyHandler)
+  router.get('/orchestration/locations',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchLocationsHandler)
   router.post('/orchestration/booking-request',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingRequestHandler)
   router.post('/orchestration/booking-cancel',
