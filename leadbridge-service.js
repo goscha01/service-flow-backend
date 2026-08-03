@@ -47,6 +47,7 @@ const { makeRequireOrchestrationEnabled } = require('./lib/lb-orchestration-feat
 const { makeOrchestrationAuthDispatcher } = require('./lib/lb-orchestration-auth')
 const {
   makeAvailabilityHandler,
+  makeBusyHandler,
   makeBookingRequestHandler,
   makeBookingCancelHandler,
   makeHandoffHandler,
@@ -1664,6 +1665,32 @@ module.exports = (supabase, logger) => {
   // Old sync/reconcile flows are completely untouched.
   // ══════════════════════════════════════
   const orchAvailabilityHandler = makeAvailabilityHandler({ supabase, logger })
+  // Two-step scope resolver used by /orchestration/busy so LB can filter
+  // busy windows by SavedAccount (per-location). Step 1: find SF's
+  // provider_accounts row for (userId, externalBusinessId). Step 2: hand
+  // its id + optional externalLocationId to the shared
+  // resolveConversationLocation helper (defined above). Returns
+  // { locationId, resolution } — resolution string mirrors the
+  // resolveConversationLocation vocabulary plus 'unknown_business' when
+  // step 1 finds nothing.
+  const resolveLocationForOrchestrationScope = async ({ userId, externalBusinessId, externalLocationId }) => {
+    if (!externalBusinessId) return { locationId: null, resolution: 'no_business_id' }
+    const { data: pa } = await supabase
+      .from('provider_accounts')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('external_business_id', externalBusinessId)
+      .maybeSingle()
+    if (!pa) return { locationId: null, resolution: 'unknown_business' }
+    return resolveConversationLocation({
+      providerAccountId: pa.id,
+      externalLocationId: externalLocationId || null,
+      externalBusinessId,
+    })
+  }
+  const orchBusyHandler = makeBusyHandler({
+    supabase, logger, resolveLocationForOrchestrationScope,
+  })
   const orchBookingRequestHandler = makeBookingRequestHandler({
     supabase, logger, setCustomerAcquisitionIfMissing: _setCustomerAcquisitionIfMissing2B,
   })
@@ -1680,6 +1707,8 @@ module.exports = (supabase, logger) => {
 
   router.get('/orchestration/availability',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchAvailabilityHandler)
+  router.get('/orchestration/busy',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBusyHandler)
   router.post('/orchestration/booking-request',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingRequestHandler)
   router.post('/orchestration/booking-cancel',
