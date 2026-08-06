@@ -1070,14 +1070,17 @@ app.use((req, _res, next) => {
 // /api/integrations/leadbridge/* — LeadBridge is a distinct product.
 app.use((req, _res, next) => {
   const url = req.url;
-  if (url.startsWith('/api/opportunities')) {
-    req.url = '/api/opportunities' + url.slice('/api/opportunities'.length);
-  } else if (url.startsWith('/api/opportunity-source-mappings')) {
-    req.url = '/api/opportunity-source-mappings' + url.slice('/api/opportunity-source-mappings'.length);
-  } else if (url.startsWith('/api/opportunity-sources')) {
-    req.url = '/api/opportunity-sources' + url.slice('/api/opportunity-sources'.length);
+  // Order matters: /api/lead-source-mappings must be tested before /api/lead-sources,
+  // and /api/lead-sources / /api/lead-source-mappings / /api/lead-automation must
+  // all be tested before the shorter /api/leads prefix.
+  if (url.startsWith('/api/lead-source-mappings')) {
+    req.url = '/api/opportunity-source-mappings' + url.slice('/api/lead-source-mappings'.length);
+  } else if (url.startsWith('/api/lead-sources')) {
+    req.url = '/api/opportunity-sources' + url.slice('/api/lead-sources'.length);
   } else if (url.startsWith('/api/lead-automation')) {
     req.url = '/api/opportunity-automation' + url.slice('/api/lead-automation'.length);
+  } else if (url.startsWith('/api/leads')) {
+    req.url = '/api/opportunities' + url.slice('/api/leads'.length);
   }
   next();
 });
