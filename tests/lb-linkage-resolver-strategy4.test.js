@@ -42,7 +42,7 @@ function stub({ leads = [], identities = [], customer = null, customerUpdateRetu
           return Promise.resolve({ data: null, error: null });
         },
         then(resolve) {
-          if (table === 'leads') {
+          if (table === 'opportunities') {
             const rows = leads.filter(r => Object.entries(filter).every(([k, v]) => k.startsWith('__') || String(r[k]) === String(v)));
             resolve({ data: rows, error: null });
             return;

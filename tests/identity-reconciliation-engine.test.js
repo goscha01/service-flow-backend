@@ -318,11 +318,18 @@ describe('MATCH_STEP_TO_CONFIDENCE', () => {
 function makeMockSupabase(seed = {}) {
   const state = {
     identities: (seed.identities || []).map(x => ({ ...x })),
-    leads: (seed.leads || []).map(x => ({ ...x })),
+    opportunities: (seed.leads || seed.opportunities || []).map(x => ({ ...x })),
     customers: (seed.customers || []).map(x => ({ ...x })),
     ambiguities: [],
     nextIdentityId: 1000,
   };
+  // Legacy alias — tests still reference supabase._state.leads.
+  Object.defineProperty(state, 'leads', {
+    get() { return state.opportunities; },
+    set(v) { state.opportunities = v; },
+    enumerable: false,
+    configurable: true,
+  });
 
   function fromIdentities() {
     let filters = [];
@@ -439,7 +446,7 @@ function makeMockSupabase(seed = {}) {
     from(tbl) {
       if (tbl === 'communication_participant_identities') return fromIdentities();
       if (tbl === 'communication_identity_ambiguities') return fromAmbiguities();
-      if (tbl === 'leads' || tbl === 'customers') return fromTable(tbl);
+      if (tbl === 'opportunities' || tbl === 'customers') return fromTable(tbl);
       throw new Error(`mock: unknown table ${tbl}`);
     },
     _state: state,
@@ -484,7 +491,7 @@ describe('reconcile() — integration', () => {
         name_token_set: 'linda mau', display_name: 'Linda Mau',
         sf_lead_id: 700, sf_customer_id: null,
       }],
-      leads: [{ id: 700, user_id: 2, parent_lead_id: null }],
+      leads: [{ id: 700, user_id: 2, parent_opportunity_id: null }],
     });
     const r = await reconcile(supabase, null, {
       userId: 2, source: 'leadbridge', externalId: 'LB100',
@@ -507,7 +514,7 @@ describe('reconcile() — integration', () => {
         name_token_set: 'diaz maria', display_name: 'Maria Diaz',
         sf_lead_id: 245, sf_customer_id: null,
       }],
-      leads: [{ id: 245, user_id: 2, parent_lead_id: 100 }], // parent is itself a child
+      leads: [{ id: 245, user_id: 2, parent_opportunity_id: 100 }], // parent is itself a child
     });
     const r = await reconcile(supabase, null, {
       userId: 2, source: 'leadbridge', externalId: 'LB200',

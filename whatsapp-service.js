@@ -407,7 +407,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
                   await supabase.from('communication_conversations').update({ customer_id: customer.id }).eq('id', existingConv.id)
                   waSyncProgress[userId].linked++
                 } else {
-                  const { data: lead } = await supabase.from('leads')
+                  const { data: lead } = await supabase.from('opportunities')
                     .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
                   if (lead) {
                     await supabase.from('communication_conversations').update({ lead_id: lead.id }).eq('id', existingConv.id)

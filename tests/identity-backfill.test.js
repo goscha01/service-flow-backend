@@ -137,7 +137,7 @@ function makeMockSupabase(seed = {}) {
       if (tbl === 'communication_participant_mappings') return tableAccess(state.mappings);
       if (tbl === 'communication_conversations') return tableAccess(state.conversations);
       if (tbl === 'customers') return tableAccess(state.customers);
-      if (tbl === 'leads') return tableAccess(state.leads);
+      if (tbl === 'opportunities') return tableAccess(state.leads);
       if (tbl === 'communication_identity_ambiguities') return { insert: (row) => { state.ambiguities.push(row); return Promise.resolve({ data: null, error: null }); } };
       throw new Error('mock: unknown table ' + tbl);
     },

@@ -1063,6 +1063,25 @@ app.use((req, _res, next) => {
   next();
 });
 
+// Legacy /api/lead* → /api/opportunit* URL rewrite (migration 076 rename).
+// The CRM entity was renamed Lead → Opportunity. Handlers are registered
+// under the new /api/opportunit* paths only; this middleware makes the old
+// URLs keep working for any client that hasn't cut over yet. Does NOT touch
+// /api/integrations/leadbridge/* — LeadBridge is a distinct product.
+app.use((req, _res, next) => {
+  const url = req.url;
+  if (url.startsWith('/api/opportunities')) {
+    req.url = '/api/opportunities' + url.slice('/api/opportunities'.length);
+  } else if (url.startsWith('/api/opportunity-source-mappings')) {
+    req.url = '/api/opportunity-source-mappings' + url.slice('/api/opportunity-source-mappings'.length);
+  } else if (url.startsWith('/api/opportunity-sources')) {
+    req.url = '/api/opportunity-sources' + url.slice('/api/opportunity-sources'.length);
+  } else if (url.startsWith('/api/lead-automation')) {
+    req.url = '/api/opportunity-automation' + url.slice('/api/lead-automation'.length);
+  }
+  next();
+});
+
 // Apply rate limiting
 // Note: More specific paths must come first. The generalLimiter skips paths
 // that already have their own limiter to avoid double-counting.
@@ -2383,7 +2402,7 @@ app.delete('/api/auth/delete-account/:userId', authenticateToken, async (req, re
 
     // 10. Delete leads and related data
     const { error: leadsError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .delete()
       .eq('user_id', userId);
     if (leadsError) {
@@ -8166,8 +8185,8 @@ app.delete('/api/jobs/:id', authenticateToken, async (req, res) => {
 // Helper: build source resolver for a user (closure over canonical set + mappings)
 async function buildSourceResolver(userId) {
   const [sourcesRes, mappingsRes] = await Promise.all([
-    supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
-    supabase.from('lead_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
+    supabase.from('opportunity_sources').select('name').eq('user_id', userId).eq('is_active', true),
+    supabase.from('opportunity_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
   ]);
   const canonicalSet = new Set((sourcesRes.data || []).map(s => s.name));
   const sourceMap = {};
@@ -8369,7 +8388,7 @@ async function lookupCRMByPhone(tenantId, phoneE164) {
 
   const [custsRes, leadsRes] = await Promise.all([
     supabase.from('customers').select('id').eq('user_id', tenantId).ilike('phone', likeFragment),
-    supabase.from('leads').select('id').eq('user_id', tenantId).ilike('phone', likeFragment).limit(10),
+    supabase.from('opportunities').select('id').eq('user_id', tenantId).ilike('phone', likeFragment).limit(10),
   ]);
   result.customers = (custsRes.data || []).map(r => r.id);
   result.leads = (leadsRes.data || []).map(r => r.id);
@@ -8531,12 +8550,12 @@ async function linkMappingToIdentity(tenantId, sigParticipant, mapping) {
 // write fails we still want the primary decision to stand.
 async function logOpDecision({ userId, identityId, outcome, reason, leadId, customerId, canonicalSource, company, lastEventAt }) {
   try {
-    await supabase.from('communication_openphone_lead_decisions').insert({
+    await supabase.from('communication_openphone_opportunity_decisions').insert({
       user_id: userId,
       identity_id: identityId || null,
       outcome,
       reason: reason || null,
-      lead_id: leadId || null,
+      opportunity_id: leadId || null,
       customer_id: customerId || null,
       canonical_source: canonicalSource || null,
       company: company || null,
@@ -8553,7 +8572,7 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     return null;
   }
 
-  const { data: mappings } = await supabase.from('lead_source_mappings')
+  const { data: mappings } = await supabase.from('opportunity_source_mappings')
     .select('source_name').eq('user_id', userId).eq('provider', 'openphone')
     .ilike('raw_value', String(company).trim()).limit(1);
   const canonicalSource = mappings?.[0]?.source_name || null;
@@ -8684,10 +8703,10 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
 
   // No CRM match — proceed with lead creation.
   // Default pipeline + first stage.
-  const { data: pipeline } = await supabase.from('lead_pipelines')
+  const { data: pipeline } = await supabase.from('opportunity_pipelines')
     .select('id').eq('user_id', userId).eq('is_default', true).maybeSingle();
   if (!pipeline) { logger.warn('[OP] No default pipeline for user', userId); return null; }
-  const { data: stages } = await supabase.from('lead_stages')
+  const { data: stages } = await supabase.from('opportunity_stages')
     .select('id, name, position').eq('pipeline_id', pipeline.id).order('position', { ascending: true });
   if (!stages?.length) { logger.warn('[OP] No stages in default pipeline', pipeline.id); return null; }
   const stage = stages.find(s => s.name === 'New Lead' || s.position === 0) || stages[0];
@@ -8697,7 +8716,7 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   const lastName = nameParts.slice(1).join(' ') || null;
   const phone = identity.normalized_phone ? `+1${identity.normalized_phone}` : null;
 
-  const { data: newLead, error } = await supabase.from('leads').insert({
+  const { data: newLead, error } = await supabase.from('opportunities').insert({
     user_id: userId,
     pipeline_id: pipeline.id,
     stage_id: stage.id,
@@ -9541,13 +9560,13 @@ app.delete('/api/customers/:id/properties/:propertyId', authenticateToken, async
 // ============================================
 
 // Get or create default pipeline for user
-app.get('/api/leads/pipeline', authenticateToken, async (req, res) => {
+app.get('/api/opportunities/pipeline', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     
     // Check if user has a default pipeline
     const { data: pipelines, error } = await supabase
-      .from('lead_pipelines')
+      .from('opportunity_pipelines')
       .select('*')
       .eq('user_id', userId)
       .eq('is_default', true)
@@ -9562,7 +9581,7 @@ app.get('/api/leads/pipeline', authenticateToken, async (req, res) => {
     if (!pipelines || pipelines.length === 0) {
       // Create default pipeline with default stages
       const { data: newPipeline, error: createError } = await supabase
-        .from('lead_pipelines')
+        .from('opportunity_pipelines')
         .insert({
           user_id: userId,
           name: 'Default Pipeline',
@@ -9597,7 +9616,7 @@ app.get('/api/leads/pipeline', authenticateToken, async (req, res) => {
       }));
       
       const { error: stagesError } = await supabase
-        .from('lead_stages')
+        .from('opportunity_stages')
         .insert(stagesToInsert);
       
       if (stagesError) {
@@ -9610,7 +9629,7 @@ app.get('/api/leads/pipeline', authenticateToken, async (req, res) => {
     
     // Fetch stages for this pipeline
     const { data: stages, error: stagesError } = await supabase
-      .from('lead_stages')
+      .from('opportunity_stages')
       .select('*')
       .eq('pipeline_id', pipeline.id)
       .order('position', { ascending: true });
@@ -9631,7 +9650,7 @@ app.get('/api/leads/pipeline', authenticateToken, async (req, res) => {
 });
 
 // Update pipeline stages (reorder, add, update, delete)
-app.put('/api/leads/pipeline/stages', authenticateToken, async (req, res) => {
+app.put('/api/opportunities/pipeline/stages', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { stages } = req.body; // Array of stage objects with id, name, color, position
@@ -9642,7 +9661,7 @@ app.put('/api/leads/pipeline/stages', authenticateToken, async (req, res) => {
     
     // Get user's default pipeline
     const { data: pipelines, error: pipelineError } = await supabase
-      .from('lead_pipelines')
+      .from('opportunity_pipelines')
       .select('id')
       .eq('user_id', userId)
       .eq('is_default', true)
@@ -9660,7 +9679,7 @@ app.put('/api/leads/pipeline/stages', authenticateToken, async (req, res) => {
       if (stage.id) {
         // Update existing stage
         const { error: updateError } = await supabase
-          .from('lead_stages')
+          .from('opportunity_stages')
           .update({
             name: stage.name,
             color: stage.color,
@@ -9675,7 +9694,7 @@ app.put('/api/leads/pipeline/stages', authenticateToken, async (req, res) => {
       } else {
         // Create new stage
         const { error: insertError } = await supabase
-          .from('lead_stages')
+          .from('opportunity_stages')
           .insert({
             pipeline_id: pipelineId,
             name: stage.name,
@@ -9691,7 +9710,7 @@ app.put('/api/leads/pipeline/stages', authenticateToken, async (req, res) => {
     
     // Fetch updated stages
     const { data: updatedStages, error: fetchError } = await supabase
-      .from('lead_stages')
+      .from('opportunity_stages')
       .select('*')
       .eq('pipeline_id', pipelineId)
       .order('position', { ascending: true });
@@ -9708,29 +9727,29 @@ app.put('/api/leads/pipeline/stages', authenticateToken, async (req, res) => {
 });
 
 // Delete a stage
-app.delete('/api/leads/pipeline/stages/:id', authenticateToken, async (req, res) => {
+app.delete('/api/opportunities/pipeline/stages/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
     
     // Verify pipeline ownership
     const { data: stage, error: stageError } = await supabase
-      .from('lead_stages')
-      .select('pipeline_id, lead_pipelines!inner(user_id)')
+      .from('opportunity_stages')
+      .select('pipeline_id, opportunity_pipelines!inner(user_id)')
       .eq('id', id)
       .single();
-    
+
     if (stageError || !stage) {
       return res.status(404).json({ error: 'Stage not found' });
     }
-    
-    if (stage.lead_pipelines.user_id !== userId) {
+
+    if (stage.opportunity_pipelines.user_id !== userId) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     
     // Check if stage has leads
     const { data: leads, error: leadsError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select('id')
       .eq('stage_id', id)
       .limit(1);
@@ -9745,7 +9764,7 @@ app.delete('/api/leads/pipeline/stages/:id', authenticateToken, async (req, res)
     
     // Delete stage
     const { error: deleteError } = await supabase
-      .from('lead_stages')
+      .from('opportunity_stages')
       .delete()
       .eq('id', id);
     
@@ -9761,16 +9780,16 @@ app.delete('/api/leads/pipeline/stages/:id', authenticateToken, async (req, res)
 });
 
 // Get all leads for a user
-app.get('/api/leads', authenticateToken, async (req, res) => {
+app.get('/api/opportunities', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     
     const { data: leads, error } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select(`
         *,
-        lead_stages (*),
-        lead_pipelines (*)
+        opportunity_stages (*),
+        opportunity_pipelines (*)
       `)
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
@@ -9789,16 +9808,16 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
 
 // IMPORTANT: /api/leads/tasks must come BEFORE /api/leads/:id to prevent routing conflicts
 // Get all tasks (not tied to a specific lead)
-app.get('/api/leads/tasks', authenticateToken, async (req, res) => {
+app.get('/api/opportunities/tasks', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { status, overdue } = req.query;
     
     let query = supabase
-      .from('lead_tasks')
+      .from('opportunity_tasks')
       .select(`
         *,
-        leads (
+        opportunities (
           id,
           first_name,
           last_name,
@@ -9838,17 +9857,17 @@ app.get('/api/leads/tasks', authenticateToken, async (req, res) => {
 });
 
 // Get a single lead
-app.get('/api/leads/:id', authenticateToken, async (req, res) => {
+app.get('/api/opportunities/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
     
     const { data: leads, error } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select(`
         *,
-        lead_stages (*),
-        lead_pipelines (*),
+        opportunity_stages (*),
+        opportunity_pipelines (*),
         customers (id, first_name, last_name, email)
       `)
       .eq('id', id)
@@ -9872,7 +9891,7 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
 });
 
 // Create a new lead
-app.post('/api/leads', authenticateToken, async (req, res) => {
+app.post('/api/opportunities', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { firstName, lastName, email, phone, company, address, source, notes, value, stageId, pipelineId, serviceId } = req.body;
@@ -9881,7 +9900,7 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
     let finalPipelineId = pipelineId;
     if (!finalPipelineId) {
       const { data: pipelines, error: pipelineError } = await supabase
-        .from('lead_pipelines')
+        .from('opportunity_pipelines')
         .select('id')
         .eq('user_id', userId)
         .eq('is_default', true)
@@ -9898,7 +9917,7 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
     let finalStageId = stageId;
     if (!finalStageId) {
       const { data: stages, error: stagesError } = await supabase
-        .from('lead_stages')
+        .from('opportunity_stages')
         .select('id')
         .eq('pipeline_id', finalPipelineId)
         .order('position', { ascending: true })
@@ -9917,7 +9936,7 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
       : null;
     
     const { data: lead, error } = await supabase
-      .from('leads')
+      .from('opportunities')
       .insert({
         user_id: userId,
         pipeline_id: finalPipelineId,
@@ -9935,8 +9954,8 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
       })
       .select(`
         *,
-        lead_stages (*),
-        lead_pipelines (*)
+        opportunity_stages (*),
+        opportunity_pipelines (*)
       `)
       .single();
     
@@ -9968,7 +9987,7 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
 });
 
 // Update a lead
-app.put('/api/leads/:id', authenticateToken, async (req, res) => {
+app.put('/api/opportunities/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
@@ -9976,7 +9995,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     
     // Verify ownership
     const { data: existingLead, error: checkError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select('id')
       .eq('id', id)
       .eq('user_id', userId)
@@ -10005,13 +10024,13 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     if (serviceId !== undefined) updateData.service_id = serviceId || null;
     
     const { data: lead, error } = await supabase
-      .from('leads')
+      .from('opportunities')
       .update(updateData)
       .eq('id', id)
       .select(`
         *,
-        lead_stages (*),
-        lead_pipelines (*)
+        opportunity_stages (*),
+        opportunity_pipelines (*)
       `)
       .single();
     
@@ -10043,14 +10062,14 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
 });
 
 // Delete a lead
-app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
+app.delete('/api/opportunities/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
     
     // Verify ownership
     const { data: existingLead, error: checkError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select('id')
       .eq('id', id)
       .eq('user_id', userId)
@@ -10061,7 +10080,7 @@ app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
     }
     
     const { error: deleteError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .delete()
       .eq('id', id);
     
@@ -10077,7 +10096,7 @@ app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
 });
 
 // Move lead to different stage (for drag and drop)
-app.put('/api/leads/:id/move', authenticateToken, async (req, res) => {
+app.put('/api/opportunities/:id/move', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
@@ -10089,7 +10108,7 @@ app.put('/api/leads/:id/move', authenticateToken, async (req, res) => {
     
     // Verify ownership
     const { data: existingLead, error: checkError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select('id')
       .eq('id', id)
       .eq('user_id', userId)
@@ -10101,13 +10120,13 @@ app.put('/api/leads/:id/move', authenticateToken, async (req, res) => {
     
     // Update stage
     const { data: lead, error } = await supabase
-      .from('leads')
+      .from('opportunities')
       .update({ stage_id: stageId })
       .eq('id', id)
       .select(`
         *,
-        lead_stages (*),
-        lead_pipelines (*)
+        opportunity_stages (*),
+        opportunity_pipelines (*)
       `)
       .single();
     
@@ -10128,14 +10147,14 @@ app.put('/api/leads/:id/move', authenticateToken, async (req, res) => {
 // ============================================
 
 // Get all tasks for a lead
-app.get('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
+app.get('/api/opportunities/:opportunityId/tasks', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { leadId } = req.params;
     
     // Verify lead ownership
     const { data: lead, error: leadError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select('id')
       .eq('id', leadId)
       .eq('user_id', userId)
@@ -10146,7 +10165,7 @@ app.get('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
     }
     
     const { data: tasks, error } = await supabase
-      .from('lead_tasks')
+      .from('opportunity_tasks')
       .select(`
         *,
         team_members (
@@ -10155,7 +10174,7 @@ app.get('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
           last_name
         )
       `)
-      .eq('lead_id', leadId)
+      .eq('opportunity_id', leadId)
       .eq('user_id', userId)
       .order('due_date', { ascending: true, nullsFirst: true })
       .order('created_at', { ascending: false });
@@ -10177,7 +10196,7 @@ app.get('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
 // The route definition is now at line ~7088, before the /api/leads/:id route
 
 // Create a new task for a lead
-app.post('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
+app.post('/api/opportunities/:opportunityId/tasks', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { leadId } = req.params;
@@ -10189,7 +10208,7 @@ app.post('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
     
     // Verify lead ownership
     const { data: lead, error: leadError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select('id')
       .eq('id', leadId)
       .eq('user_id', userId)
@@ -10214,9 +10233,9 @@ app.post('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
     }
     
     const { data: task, error } = await supabase
-      .from('lead_tasks')
+      .from('opportunity_tasks')
       .insert({
-        lead_id: parseInt(leadId),
+        opportunity_id: parseInt(leadId),
         user_id: userId,
         title: title.trim(),
         description: description || null,
@@ -10248,7 +10267,7 @@ app.post('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
 });
 
 // Update a task
-app.put('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
+app.put('/api/opportunities/tasks/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
@@ -10256,7 +10275,7 @@ app.put('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
     
     // Verify task ownership
     const { data: existingTask, error: checkError } = await supabase
-      .from('lead_tasks')
+      .from('opportunity_tasks')
       .select('id, status')
       .eq('id', id)
       .eq('user_id', userId)
@@ -10297,7 +10316,7 @@ app.put('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
     }
     
     const { data: task, error } = await supabase
-      .from('lead_tasks')
+      .from('opportunity_tasks')
       .update(updateData)
       .eq('id', id)
       .select(`
@@ -10323,14 +10342,14 @@ app.put('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
 });
 
 // Delete a task
-app.delete('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
+app.delete('/api/opportunities/tasks/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
     
     // Verify task ownership
     const { data: existingTask, error: checkError } = await supabase
-      .from('lead_tasks')
+      .from('opportunity_tasks')
       .select('id')
       .eq('id', id)
       .eq('user_id', userId)
@@ -10341,7 +10360,7 @@ app.delete('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
     }
     
     const { error: deleteError } = await supabase
-      .from('lead_tasks')
+      .from('opportunity_tasks')
       .delete()
       .eq('id', id);
     
@@ -10357,14 +10376,14 @@ app.delete('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
 });
 
 // Convert lead to customer
-app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
+app.post('/api/opportunities/:id/convert', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
     
     // Get lead details
     const { data: lead, error: leadError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select('*')
       .eq('id', id)
       .eq('user_id', userId)
@@ -10416,7 +10435,7 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
     try {
       // Get user's pipeline
       const { data: pipelines, error: pipelineError } = await supabase
-        .from('lead_pipelines')
+        .from('opportunity_pipelines')
         .select('id')
         .eq('user_id', userId)
         .limit(1);
@@ -10426,7 +10445,7 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
         
         // Find "Won" stage in this pipeline
         const { data: wonStage, error: stageError } = await supabase
-          .from('lead_stages')
+          .from('opportunity_stages')
           .select('id')
           .eq('pipeline_id', pipelineId)
           .ilike('name', 'Won')
@@ -10490,7 +10509,7 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
     }
     
     const { error: updateError } = await supabase
-      .from('leads')
+      .from('opportunities')
       .update(updateData)
       .eq('id', id);
     
@@ -10519,22 +10538,22 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
 // Lead Sources CRUD
 // ═══════════════════════════════════════════════════════════════
 
-app.get('/api/lead-sources', authenticateToken, async (req, res) => {
+app.get('/api/opportunity-sources', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { data, error } = await supabase.from('lead_sources')
+    const { data, error } = await supabase.from('opportunity_sources')
       .select('*').eq('user_id', userId).order('sort_order').order('name');
     if (error) return res.status(500).json({ error: 'Failed to fetch lead sources' });
     res.json({ sources: data || [] });
   } catch (e) { res.status(500).json({ error: 'Failed to fetch lead sources' }); }
 });
 
-app.post('/api/lead-sources', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-sources', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { name } = req.body;
     if (!name?.trim()) return res.status(400).json({ error: 'Name is required' });
-    const { data, error } = await supabase.from('lead_sources')
+    const { data, error } = await supabase.from('opportunity_sources')
       .upsert({ user_id: userId, name: name.trim(), is_active: true }, { onConflict: 'user_id,name' })
       .select().single();
     if (error) return res.status(500).json({ error: 'Failed to create lead source' });
@@ -10543,20 +10562,20 @@ app.post('/api/lead-sources', authenticateToken, async (req, res) => {
 });
 
 // Reorder sources (bulk update sort_order) — MUST be before /:id route
-app.put('/api/lead-sources/reorder', authenticateToken, async (req, res) => {
+app.put('/api/opportunity-sources/reorder', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { order } = req.body; // array of source IDs in desired order
     if (!Array.isArray(order)) return res.status(400).json({ error: 'order array required' });
     for (let i = 0; i < order.length; i++) {
-      await supabase.from('lead_sources').update({ sort_order: i }).eq('id', order[i]).eq('user_id', userId);
+      await supabase.from('opportunity_sources').update({ sort_order: i }).eq('id', order[i]).eq('user_id', userId);
     }
-    const { data } = await supabase.from('lead_sources').select('*').eq('user_id', userId).order('sort_order');
+    const { data } = await supabase.from('opportunity_sources').select('*').eq('user_id', userId).order('sort_order');
     res.json({ sources: data || [] });
   } catch (e) { res.status(500).json({ error: 'Failed to reorder sources' }); }
 });
 
-app.put('/api/lead-sources/:id', authenticateToken, async (req, res) => {
+app.put('/api/opportunity-sources/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
@@ -10565,18 +10584,18 @@ app.put('/api/lead-sources/:id', authenticateToken, async (req, res) => {
     if (name !== undefined) updates.name = name.trim();
     if (is_active !== undefined) updates.is_active = is_active;
     if (sort_order !== undefined) updates.sort_order = sort_order;
-    const { data, error } = await supabase.from('lead_sources')
+    const { data, error } = await supabase.from('opportunity_sources')
       .update(updates).eq('id', id).eq('user_id', userId).select().single();
     if (error) return res.status(500).json({ error: 'Failed to update lead source' });
     res.json(data);
   } catch (e) { res.status(500).json({ error: 'Failed to update lead source' }); }
 });
 
-app.delete('/api/lead-sources/:id', authenticateToken, async (req, res) => {
+app.delete('/api/opportunity-sources/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { error } = await supabase.from('lead_sources')
+    const { error } = await supabase.from('opportunity_sources')
       .delete().eq('id', id).eq('user_id', userId);
     if (error) return res.status(500).json({ error: 'Failed to delete lead source' });
     res.json({ success: true });
@@ -10584,22 +10603,22 @@ app.delete('/api/lead-sources/:id', authenticateToken, async (req, res) => {
 });
 
 // Seed default sources for a user (called on first load if empty)
-app.post('/api/lead-sources/seed', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-sources/seed', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { count } = await supabase.from('lead_sources')
+    const { count } = await supabase.from('opportunity_sources')
       .select('id', { count: 'exact', head: true }).eq('user_id', userId);
     if (count > 0) return res.json({ seeded: false, message: 'Sources already exist' });
     const defaults = ['Thumbtack', 'Yelp', 'Google', 'Facebook', 'Website', 'Referral', 'Cold Call', 'Instagram', 'Groupon', 'Bark', 'Other'];
     const rows = defaults.map((name, i) => ({ user_id: userId, name, sort_order: i, is_active: true }));
-    await supabase.from('lead_sources').insert(rows);
-    const { data } = await supabase.from('lead_sources').select('*').eq('user_id', userId).order('sort_order');
+    await supabase.from('opportunity_sources').insert(rows);
+    const { data } = await supabase.from('opportunity_sources').select('*').eq('user_id', userId).order('sort_order');
     res.json({ seeded: true, sources: data || [] });
   } catch (e) { res.status(500).json({ error: 'Failed to seed lead sources' }); }
 });
 
 // Import sources from OpenPhone company tags (bulk upsert)
-app.post('/api/lead-sources/import-from-openphone', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-sources/import-from-openphone', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { data: convs } = await supabase.from('communication_conversations')
@@ -10607,16 +10626,16 @@ app.post('/api/lead-sources/import-from-openphone', authenticateToken, async (re
     const unique = [...new Set((convs || []).map(c => c.company).filter(Boolean))];
     if (!unique.length) return res.json({ imported: 0, sources: [] });
     // Get existing to find max sort_order
-    const { data: existing } = await supabase.from('lead_sources')
+    const { data: existing } = await supabase.from('opportunity_sources')
       .select('name, sort_order').eq('user_id', userId);
     const existingNames = new Set((existing || []).map(s => s.name));
     const maxOrder = Math.max(0, ...(existing || []).map(s => s.sort_order || 0));
     const newSources = unique.filter(n => !existingNames.has(n));
     if (newSources.length > 0) {
       const rows = newSources.map((name, i) => ({ user_id: userId, name, sort_order: maxOrder + i + 1, is_active: true }));
-      await supabase.from('lead_sources').insert(rows);
+      await supabase.from('opportunity_sources').insert(rows);
     }
-    const { data: all } = await supabase.from('lead_sources')
+    const { data: all } = await supabase.from('opportunity_sources')
       .select('*').eq('user_id', userId).order('sort_order');
     res.json({ imported: newSources.length, sources: all || [] });
   } catch (e) { res.status(500).json({ error: 'Failed to import sources' }); }
@@ -10627,12 +10646,12 @@ app.post('/api/lead-sources/import-from-openphone', authenticateToken, async (re
 // ═══════════════════════════════════════════════════════════════
 
 // GET unmapped raw values with counts + existing mappings
-app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
+app.get('/api/opportunity-source-mappings', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
 
     // Get existing mappings
-    const { data: mappings } = await supabase.from('lead_source_mappings')
+    const { data: mappings } = await supabase.from('opportunity_source_mappings')
       .select('*').eq('user_id', userId).order('raw_value');
 
     // Paginate ALL OpenPhone conversations (Supabase default limit is 1000)
@@ -10686,8 +10705,8 @@ app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
     // (covers values like "leadbridge_yelp" set by lead-conversion flow that never appeared in conversations)
     const [custSrcRes, leadSrcRes, canonSrcRes] = await Promise.all([
       supabase.from('customers').select('source').eq('user_id', userId).not('source', 'is', null),
-      supabase.from('leads').select('source').eq('user_id', userId).not('source', 'is', null).limit(5000),
-      supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
+      supabase.from('opportunities').select('source').eq('user_id', userId).not('source', 'is', null).limit(5000),
+      supabase.from('opportunity_sources').select('name').eq('user_id', userId).eq('is_active', true),
     ]);
     const canonicalSet = new Set((canonSrcRes.data || []).map(s => s.name));
     const custCounts = {};
@@ -10725,12 +10744,12 @@ app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
 });
 
 // Save a single mapping (upsert)
-app.post('/api/lead-source-mappings', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-source-mappings', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { raw_value, source_name, provider } = req.body;
     if (!raw_value || !source_name) return res.status(400).json({ error: 'raw_value and source_name are required' });
-    const { data, error } = await supabase.from('lead_source_mappings')
+    const { data, error } = await supabase.from('opportunity_source_mappings')
       .upsert({ user_id: userId, raw_value, source_name, provider: provider || 'openphone' },
         { onConflict: 'user_id,raw_value,provider' })
       .select().single();
@@ -10740,7 +10759,7 @@ app.post('/api/lead-source-mappings', authenticateToken, async (req, res) => {
 });
 
 // Bulk save mappings
-app.post('/api/lead-source-mappings/bulk', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-source-mappings/bulk', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { mappings } = req.body;
@@ -10751,7 +10770,7 @@ app.post('/api/lead-source-mappings/bulk', authenticateToken, async (req, res) =
       source_name: m.source_name,
       provider: m.provider || 'openphone',
     }));
-    const { error } = await supabase.from('lead_source_mappings')
+    const { error } = await supabase.from('opportunity_source_mappings')
       .upsert(rows, { onConflict: 'user_id,raw_value,provider' });
     if (error) return res.status(500).json({ error: 'Failed to save mappings' });
     res.json({ saved: rows.length });
@@ -10759,10 +10778,10 @@ app.post('/api/lead-source-mappings/bulk', authenticateToken, async (req, res) =
 });
 
 // Delete a mapping
-app.delete('/api/lead-source-mappings/:id', authenticateToken, async (req, res) => {
+app.delete('/api/opportunity-source-mappings/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { error } = await supabase.from('lead_source_mappings')
+    const { error } = await supabase.from('opportunity_source_mappings')
       .delete().eq('id', req.params.id).eq('user_id', userId);
     if (error) return res.status(500).json({ error: 'Failed to delete mapping' });
     res.json({ success: true });
@@ -10770,17 +10789,17 @@ app.delete('/api/lead-source-mappings/:id', authenticateToken, async (req, res) 
 });
 
 // Auto-suggest mappings based on prefix matching
-app.post('/api/lead-source-mappings/auto-suggest', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-source-mappings/auto-suggest', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
 
     // Get user's canonical sources
-    const { data: sources } = await supabase.from('lead_sources')
+    const { data: sources } = await supabase.from('opportunity_sources')
       .select('name').eq('user_id', userId).eq('is_active', true);
     const sourceNames = (sources || []).map(s => s.name);
 
     // Get existing mappings to skip
-    const { data: existing } = await supabase.from('lead_source_mappings')
+    const { data: existing } = await supabase.from('opportunity_source_mappings')
       .select('raw_value, provider').eq('user_id', userId);
     const mappedSet = new Set((existing || []).map(m => `${m.provider}:${m.raw_value}`));
 
@@ -11020,7 +11039,7 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
       const [custCount, leadCount] = await Promise.all([
         supabase.from('customers').select('id', { count: 'exact', head: true })
           .eq('user_id', userId).in('source', ['leadbridge_yelp', 'leadbridge_thumbtack']),
-        supabase.from('leads').select('id', { count: 'exact', head: true })
+        supabase.from('opportunities').select('id', { count: 'exact', head: true })
           .eq('user_id', userId).in('source', ['leadbridge_yelp', 'leadbridge_thumbtack']),
       ]);
       legacyLbFlat.customers = custCount.count || 0;
@@ -11064,7 +11083,7 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
     // Move all FK references from sourceId → targetId
     const tables = [
       'jobs', 'invoices', 'estimates', 'transactions', 'communication_conversations',
-      'customer_notification_preferences', 'job_answers', 'leads',
+      'customer_notification_preferences', 'job_answers', 'opportunities',
     ];
     const moved = {};
     for (const t of tables) {
@@ -11118,7 +11137,7 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
       includeCallPath: false,
     });
     try {
-      await supabase.from('leads').update({ converted_customer_id: targetId })
+      await supabase.from('opportunities').update({ converted_customer_id: targetId })
         .eq('converted_customer_id', sourceId).eq('user_id', userId);
     } catch (e) { /* skip */ }
 
@@ -11183,7 +11202,7 @@ async function runParticipantBackfill(userId, apply, progress) {
       'id, participant_phone, participant_name, customer_id, lead_id, participant_mapping_id, sigcore_conversation_id',
       (q) => q.eq('user_id', userId).eq('provider', 'openphone')),
     fetchAll('customers', 'id, phone', (q) => q.eq('user_id', userId).not('phone', 'is', null)),
-    fetchAll('leads', 'id, phone', (q) => q.eq('user_id', userId).not('phone', 'is', null)),
+    fetchAll('opportunities', 'id, phone', (q) => q.eq('user_id', userId).not('phone', 'is', null)),
     fetchAll('communication_participant_mappings',
       'id, sigcore_participant_key',
       (q) => q.eq('tenant_id', userId).eq('provider', 'openphone').is('sigcore_participant_id', null).not('sigcore_participant_key', 'is', null)),
@@ -11866,7 +11885,7 @@ app.get('/api/identities/reconciliation-failures/export.csv', authenticateToken,
     const leadIds = [...new Set((candRows || []).map(c => c.sf_lead_id).filter(Boolean))];
     const [{ data: customers } = { data: [] }, { data: leads } = { data: [] }] = await Promise.all([
       customerIds.length ? supabase.from('customers').select('id, first_name, last_name, phone, email').in('id', customerIds) : Promise.resolve({ data: [] }),
-      leadIds.length ? supabase.from('leads').select('id, first_name, last_name, phone, email, source').in('id', leadIds) : Promise.resolve({ data: [] }),
+      leadIds.length ? supabase.from('opportunities').select('id, first_name, last_name, phone, email, source').in('id', leadIds) : Promise.resolve({ data: [] }),
     ]);
     const custById = {}; for (const c of (customers || [])) custById[c.id] = c;
     const leadById = {}; for (const l of (leads || [])) leadById[l.id] = l;
@@ -11980,7 +11999,7 @@ app.get('/api/identities/reconciliation-failures/export.csv', authenticateToken,
 app.get('/api/identities/op-lead-outcomes', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { data, error } = await supabase.from('communication_openphone_lead_decisions')
+    const { data, error } = await supabase.from('communication_openphone_opportunity_decisions')
       .select('outcome, created_at')
       .eq('user_id', userId)
       .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
@@ -12036,7 +12055,7 @@ app.get('/api/identities/ambiguities/:id/candidates', authenticateToken, async (
     const leadIds = candidates.map(c => c.sf_lead_id).filter(Boolean);
     const customerIds = candidates.map(c => c.sf_customer_id).filter(Boolean);
     const [leads, customers] = await Promise.all([
-      leadIds.length ? supabase.from('leads').select('id, first_name, last_name, phone, email, source, stage_id').in('id', leadIds) : Promise.resolve({ data: [] }),
+      leadIds.length ? supabase.from('opportunities').select('id, first_name, last_name, phone, email, source, stage_id').in('id', leadIds) : Promise.resolve({ data: [] }),
       customerIds.length ? supabase.from('customers').select('id, first_name, last_name, phone, email, zenbooker_id').in('id', customerIds) : Promise.resolve({ data: [] }),
     ]);
     const leadsById = {}; for (const l of (leads.data || [])) leadsById[l.id] = l;
@@ -12910,8 +12929,8 @@ app.post('/api/participants/upgrade-lb-sources', authenticateToken, async (req, 
       validNewSources.add(`${a.display_name} (${a.channel})`);
     }
 
-    // Process both tables: customers, leads
-    for (const table of ['customers', 'leads']) {
+    // Process both tables: customers, opportunities
+    for (const table of ['customers', 'opportunities']) {
       // 1. Count rows that ALREADY have a correct per-location source (idempotency visibility)
       if (validNewSources.size > 0) {
         const { count } = await supabase.from(table)
@@ -12971,7 +12990,7 @@ app.post('/api/participants/upgrade-lb-sources', authenticateToken, async (req, 
           // Path 3: for customers, also look at the converted-from lead's identity
           // (lead → customer conversion may leave the identity linked only to the lead)
           if (!providerAccountId && table === 'customers') {
-            const { data: origLead } = await supabase.from('leads')
+            const { data: origLead } = await supabase.from('opportunities')
               .select('id').eq('user_id', userId).eq('converted_customer_id', rec.id).limit(1).maybeSingle();
             if (origLead?.id) {
               const { data: identity } = await supabase.from('communication_participant_identities')
@@ -13091,7 +13110,7 @@ async function runReclassify(userId, apply, progress) {
   // Build phone→crm index for re-lookup
   const customers = await fetchAll('customers', 'id, phone',
     (q) => q.eq('user_id', userId).not('phone', 'is', null));
-  const leads = await fetchAll('leads', 'id, phone',
+  const leads = await fetchAll('opportunities', 'id, phone',
     (q) => q.eq('user_id', userId).not('phone', 'is', null));
 
   const last10 = (s) => String(s || '').replace(/\D/g, '').slice(-10);
@@ -17751,7 +17770,7 @@ app.post('/api/data-import/import', authenticateToken, async (req, res) => {
     if (type === 'team_members') importerFn = dataImporter.importTeamMembers;
     else if (type === 'services') importerFn = dataImporter.importServices;
     else if (type === 'territories') importerFn = dataImporter.importTerritories;
-    else if (type === 'leads') importerFn = dataImporter.importLeads;
+    else if (type === 'leads' || type === 'opportunities') importerFn = dataImporter.importLeads;
     else if (type === 'reviews') importerFn = dataImporter.importReviews;
 
     const result = await importerFn(supabase, userId, mappedRows, settings, onProgress);
@@ -21988,7 +22007,7 @@ app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
 
     // Get all leads for this user
     let leadsQuery = supabase
-      .from('leads')
+      .from('opportunities')
       .select('id, source, stage_id, converted_customer_id, converted_at, created_at, value')
       .eq('user_id', userId);
 
@@ -22008,7 +22027,7 @@ app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
 
     // Get all pipelines for this user
     const { data: pipelines } = await supabase
-      .from('lead_pipelines')
+      .from('opportunity_pipelines')
       .select('id')
       .eq('user_id', userId);
 
@@ -22016,7 +22035,7 @@ app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
 
     // Get all stages for context
     let stagesQuery = supabase
-      .from('lead_stages')
+      .from('opportunity_stages')
       .select('id, name, position');
     
     if (pipelineIds.length > 0) {
@@ -41422,7 +41441,7 @@ async function autoLinkConversation(userId, conversationId, phone) {
 
   // Try leads
   try {
-    const { data: lead } = await supabase.from('leads')
+    const { data: lead } = await supabase.from('opportunities')
       .select('id, first_name, last_name, name')
       .eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
     if (lead) {
@@ -42312,7 +42331,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
           if (cust) contactName = `${cust.first_name || ''} ${cust.last_name || ''}`.trim() || null;
           if (!contactName) {
             try {
-              const { data: lead } = await supabase.from('leads').select('first_name, last_name, name').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
+              const { data: lead } = await supabase.from('opportunities').select('first_name, last_name, name').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
               if (lead) contactName = lead.name || `${lead.first_name || ''} ${lead.last_name || ''}`.trim() || null;
             } catch (e) { /* leads table may not exist */ }
           }
@@ -42653,7 +42672,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       }
     } catch (e) { /* ignore */ }
     try {
-      const { data: sfLeads } = await supabase.from('leads').select('first_name, last_name, name, phone').eq('user_id', userId);
+      const { data: sfLeads } = await supabase.from('opportunities').select('first_name, last_name, name, phone').eq('user_id', userId);
       for (const l of (sfLeads || [])) {
         if (l.phone) {
           const name = l.name || `${l.first_name || ''} ${l.last_name || ''}`.trim();
@@ -43276,16 +43295,16 @@ app.post('/api/communications/location-mappings', authenticateToken, async (req,
 // ════════════════════════════════════════════════════════════════
 
 // GET /api/lead-automation/rules — list rules with stage names
-app.get('/api/lead-automation/rules', authenticateToken, async (req, res) => {
+app.get('/api/opportunity-automation/rules', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { data: rules } = await supabase.from('lead_stage_automation_rules')
+    const { data: rules } = await supabase.from('opportunity_stage_automation_rules')
       .select('*').eq('user_id', userId).order('channel', { ascending: true });
 
     // Enrich with stage names
-    const { data: stages } = await supabase.from('lead_stages')
+    const { data: stages } = await supabase.from('opportunity_stages')
       .select('id, name, position')
-      .in('pipeline_id', (await supabase.from('lead_pipelines').select('id').eq('user_id', userId).eq('is_default', true)).data?.map(p => p.id) || []);
+      .in('pipeline_id', (await supabase.from('opportunity_pipelines').select('id').eq('user_id', userId).eq('is_default', true)).data?.map(p => p.id) || []);
 
     const stageMap = {};
     for (const s of (stages || [])) stageMap[s.id] = s;
@@ -43308,7 +43327,7 @@ app.get('/api/lead-automation/rules', authenticateToken, async (req, res) => {
 });
 
 // POST /api/lead-automation/rules — create or update a rule
-app.post('/api/lead-automation/rules', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-automation/rules', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { channel, eventType, targetStageId, enabled, autoConvertToCustomer } = req.body;
@@ -43318,18 +43337,18 @@ app.post('/api/lead-automation/rules', authenticateToken, async (req, res) => {
     }
 
     // Upsert: one rule per user + channel + event
-    const { data: existing } = await supabase.from('lead_stage_automation_rules')
+    const { data: existing } = await supabase.from('opportunity_stage_automation_rules')
       .select('id').eq('user_id', userId).eq('channel', channel).eq('event_type', eventType).maybeSingle();
 
     let rule;
     if (existing) {
-      const { data, error } = await supabase.from('lead_stage_automation_rules')
+      const { data, error } = await supabase.from('opportunity_stage_automation_rules')
         .update({ target_stage_id: targetStageId, enabled: enabled !== false, auto_convert_to_customer: autoConvertToCustomer || false })
         .eq('id', existing.id).select().single();
       if (error) return res.status(500).json({ error: error.message });
       rule = data;
     } else {
-      const { data, error } = await supabase.from('lead_stage_automation_rules')
+      const { data, error } = await supabase.from('opportunity_stage_automation_rules')
         .insert({ user_id: userId, channel, event_type: eventType, target_stage_id: targetStageId, enabled: enabled !== false, auto_convert_to_customer: autoConvertToCustomer || false })
         .select().single();
       if (error) return res.status(500).json({ error: error.message });
@@ -43343,16 +43362,16 @@ app.post('/api/lead-automation/rules', authenticateToken, async (req, res) => {
 });
 
 // POST /api/lead-automation/seed-defaults — create default rules for a user
-app.post('/api/lead-automation/seed-defaults', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-automation/seed-defaults', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
 
     // Get default pipeline stages
-    const { data: pipeline } = await supabase.from('lead_pipelines')
+    const { data: pipeline } = await supabase.from('opportunity_pipelines')
       .select('id').eq('user_id', userId).eq('is_default', true).maybeSingle();
     if (!pipeline) return res.status(400).json({ error: 'No default pipeline' });
 
-    const { data: stages } = await supabase.from('lead_stages')
+    const { data: stages } = await supabase.from('opportunity_stages')
       .select('id, name, position').eq('pipeline_id', pipeline.id).order('position', { ascending: true });
     if (!stages?.length) return res.status(400).json({ error: 'No stages' });
 
@@ -43372,10 +43391,10 @@ app.post('/api/lead-automation/seed-defaults', authenticateToken, async (req, re
     for (const ch of ['thumbtack', 'yelp']) {
       for (const d of defaults) {
         if (!d.stage) continue;
-        const { data: existing } = await supabase.from('lead_stage_automation_rules')
+        const { data: existing } = await supabase.from('opportunity_stage_automation_rules')
           .select('id').eq('user_id', userId).eq('channel', ch).eq('event_type', d.event).maybeSingle();
         if (!existing) {
-          await supabase.from('lead_stage_automation_rules').insert({
+          await supabase.from('opportunity_stage_automation_rules').insert({
             user_id: userId, channel: ch, event_type: d.event,
             target_stage_id: d.stage, enabled: true,
             auto_convert_to_customer: d.convert || false,
@@ -43392,12 +43411,12 @@ app.post('/api/lead-automation/seed-defaults', authenticateToken, async (req, re
 });
 
 // POST /api/lead-automation/backfill — apply automation rules to existing leads based on their conversation state
-app.post('/api/lead-automation/backfill', authenticateToken, async (req, res) => {
+app.post('/api/opportunity-automation/backfill', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
 
     // Get all automation rules for this user
-    const { data: rules } = await supabase.from('lead_stage_automation_rules')
+    const { data: rules } = await supabase.from('opportunity_stage_automation_rules')
       .select('*').eq('user_id', userId).eq('enabled', true);
     if (!rules?.length) return res.json({ updated: 0, message: 'No automation rules configured' });
 
@@ -43408,7 +43427,7 @@ app.post('/api/lead-automation/backfill', authenticateToken, async (req, res) =>
     }
 
     // Get stage positions for forward-only check
-    const { data: allStages } = await supabase.from('lead_stages')
+    const { data: allStages } = await supabase.from('opportunity_stages')
       .select('id, position, name');
     const stagePos = {};
     for (const s of (allStages || [])) stagePos[s.id] = s.position;
@@ -43444,7 +43463,7 @@ app.post('/api/lead-automation/backfill', authenticateToken, async (req, res) =>
       if (!targetStageId) continue;
 
       // Get current lead stage
-      const { data: lead } = await supabase.from('leads')
+      const { data: lead } = await supabase.from('opportunities')
         .select('id, stage_id').eq('id', identity.sf_lead_id).maybeSingle();
       if (!lead) continue;
 
@@ -43453,7 +43472,7 @@ app.post('/api/lead-automation/backfill', authenticateToken, async (req, res) =>
       const targetPos = stagePos[targetStageId] ?? -1;
       if (targetPos <= currentPos) continue;
 
-      await supabase.from('leads').update({ stage_id: targetStageId }).eq('id', lead.id);
+      await supabase.from('opportunities').update({ stage_id: targetStageId }).eq('id', lead.id);
       updated++;
     }
 
@@ -43538,8 +43557,8 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     // Build source mapping lookup (raw → canonical)
     // Load canonical sources + mappings
     const [sourcesRes, mappingsRes] = await Promise.all([
-      supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
-      supabase.from('lead_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
+      supabase.from('opportunity_sources').select('name').eq('user_id', userId).eq('is_active', true),
+      supabase.from('opportunity_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
     ]);
     const canonicalSet = new Set((sourcesRes.data || []).map(s => s.name));
     const sourceMap = {};
@@ -43571,7 +43590,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       for (const cu of (custs || [])) crmCustomerMap[cu.id] = cu;
     }
     if (crmLeadIds.size > 0) {
-      const { data: lds } = await supabase.from('leads')
+      const { data: lds } = await supabase.from('opportunities')
         .select('id, first_name, last_name, phone, email').in('id', [...crmLeadIds]);
       for (const ld of (lds || [])) crmLeadMap[ld.id] = ld;
     }
@@ -43873,8 +43892,8 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
 
     // Resolve source through mappings — ONLY canonical sources
     const [detailSourcesRes, detailMappingsRes] = await Promise.all([
-      supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
-      supabase.from('lead_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
+      supabase.from('opportunity_sources').select('name').eq('user_id', userId).eq('is_active', true),
+      supabase.from('opportunity_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
     ]);
     const detailCanonicalSet = new Set((detailSourcesRes.data || []).map(s => s.name));
     const detailSourceMap = {};
@@ -43909,11 +43928,11 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
 
     // Check direct lead link on conversation
     if (!lead && conv.lead_id) {
-      const { data: sfLead } = await supabase.from('leads').select('id, first_name, last_name, phone, email, source, notes, stage_id').eq('id', conv.lead_id).maybeSingle();
+      const { data: sfLead } = await supabase.from('opportunities').select('id, first_name, last_name, phone, email, source, notes, stage_id').eq('id', conv.lead_id).maybeSingle();
       if (sfLead) {
         let stageName = 'Lead';
         if (sfLead.stage_id) {
-          const { data: stageData } = await supabase.from('lead_stages').select('name').eq('id', sfLead.stage_id).maybeSingle();
+          const { data: stageData } = await supabase.from('opportunity_stages').select('name').eq('id', sfLead.stage_id).maybeSingle();
           if (stageData) stageName = stageData.name;
         }
         lead = {
@@ -43940,12 +43959,12 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
           };
         }
       } else if (identity?.sf_lead_id) {
-        const { data: sfLead } = await supabase.from('leads').select('id, first_name, last_name, phone, email, source, notes, stage_id').eq('id', identity.sf_lead_id).maybeSingle();
+        const { data: sfLead } = await supabase.from('opportunities').select('id, first_name, last_name, phone, email, source, notes, stage_id').eq('id', identity.sf_lead_id).maybeSingle();
         if (sfLead) {
           // Get stage name
           let stageName = 'Lead';
           if (sfLead.stage_id) {
-            const { data: stageData } = await supabase.from('lead_stages').select('name').eq('id', sfLead.stage_id).maybeSingle();
+            const { data: stageData } = await supabase.from('opportunity_stages').select('name').eq('id', sfLead.stage_id).maybeSingle();
             if (stageData) stageName = stageData.name;
           }
           lead = {
@@ -44080,20 +44099,20 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
             // Import progressLeadStage from leadbridge-service (it's a module function)
             // For now use inline rule check
             try {
-              const { data: rule } = await supabase.from('lead_stage_automation_rules')
+              const { data: rule } = await supabase.from('opportunity_stage_automation_rules')
                 .select('target_stage_id, auto_convert_to_customer')
                 .eq('user_id', userId).eq('event_type', event).eq('enabled', true)
                 .in('channel', [conv.channel, 'all']).limit(1).maybeSingle();
               if (rule) {
-                const { data: lead } = await supabase.from('leads')
+                const { data: lead } = await supabase.from('opportunities')
                   .select('stage_id').eq('id', identity.sf_lead_id).maybeSingle();
                 if (lead) {
-                  const { data: currentStage } = await supabase.from('lead_stages')
+                  const { data: currentStage } = await supabase.from('opportunity_stages')
                     .select('position').eq('id', lead.stage_id).maybeSingle();
-                  const { data: targetStage } = await supabase.from('lead_stages')
+                  const { data: targetStage } = await supabase.from('opportunity_stages')
                     .select('position, name').eq('id', rule.target_stage_id).maybeSingle();
                   if (targetStage && (!currentStage || targetStage.position > currentStage.position)) {
-                    await supabase.from('leads').update({ stage_id: rule.target_stage_id }).eq('id', identity.sf_lead_id);
+                    await supabase.from('opportunities').update({ stage_id: rule.target_stage_id }).eq('id', identity.sf_lead_id);
                     logger.log(`[LB Stage] Lead ${identity.sf_lead_id}: ${event} → ${targetStage.name}`);
                   }
                 }

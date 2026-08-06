@@ -67,9 +67,9 @@ const ROOT = path.resolve(__dirname, '..');
 // to use the same field names.
 
 const PATTERNS = [
-  { name: 'leads.converted_customer_id',                            table: 'leads',                                  re: /converted_customer_id\s*:/ },
-  { name: 'leads.parent_lead_id',                                   table: 'leads',                                  re: /parent_lead_id\s*:/ },
-  { name: 'leads.lead_origin_type',                                 table: 'leads',                                  re: /lead_origin_type\s*:/ },
+  { name: 'opportunities.converted_customer_id',                    table: 'opportunities',                          re: /converted_customer_id\s*:/ },
+  { name: 'opportunities.parent_opportunity_id',                    table: 'opportunities',                          re: /parent_opportunity_id\s*:/ },
+  { name: 'opportunities.opportunity_origin_type',                  table: 'opportunities',                          re: /opportunity_origin_type\s*:/ },
   { name: 'communication_participant_identities.sf_lead_id',        table: 'communication_participant_identities',  re: /sf_lead_id\s*:\s*[^,}\s]+/ },
   { name: 'communication_participant_identities.sf_customer_id',    table: 'communication_participant_identities',  re: /sf_customer_id\s*:\s*[^,}\s]+/ },
   { name: 'communication_participant_identities.last_hydrated_by',  table: 'communication_participant_identities',  re: /last_hydrated_by\s*:/ },

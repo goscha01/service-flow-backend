@@ -41,8 +41,12 @@ const SF_TENANT_ID = 2;
 // Lightweight store stub — supports the matcher's leads/customers/jobs/
 // lead_stages queries plus communication_settings for tenant lookup.
 function makeStore({ leads = [], customers = [], jobs = [], lead_stages = [], commSettings = null } = {}) {
+  // Post migration-076 the code queries `opportunities` and `opportunity_stages`.
+  // Alias both names to the same row arrays so the existing fixtures work.
   const rows = {
-    leads, customers, jobs, lead_stages,
+    leads, opportunities: leads,
+    customers, jobs,
+    lead_stages, opportunity_stages: lead_stages,
     communication_settings: commSettings === null
       ? [{ user_id: SF_TENANT_ID, leadbridge_user_id: LB_USER_UUID, leadbridge_connected: true }]
       : (Array.isArray(commSettings) ? commSettings : [commSettings]),

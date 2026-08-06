@@ -30,7 +30,7 @@ function mockSupabaseWithCrm({ customers = [], leads = [] } = {}) {
   return {
     from(tbl) {
       if (tbl === 'customers') return tableChain(customers);
-      if (tbl === 'leads') return tableChain(leads);
+      if (tbl === 'opportunities') return tableChain(leads);
       if (tbl === 'communication_participant_identities') {
         return {
           update() { return { eq: () => Promise.resolve({ data: [], error: null }) }; },

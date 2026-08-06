@@ -118,7 +118,7 @@ function makeMockSupabase(seed = {}) {
     from(tbl) {
       if (tbl === 'communication_participant_identities') return tableChain(state.identities, { autoId: true });
       if (tbl === 'communication_identity_ambiguities') return fromAmbiguities();
-      if (tbl === 'leads') return tableChain(state.leads);
+      if (tbl === 'opportunities') return tableChain(state.leads);
       if (tbl === 'customers') return tableChain(state.customers);
       throw new Error(`mock: unknown table ${tbl}`);
     },
@@ -214,7 +214,7 @@ describe('LB engine adapter — scenario 2: enrich existing lead (child OFF)', (
     // To test the engine's "enrich_only" decision, we need child_leads ON (prereq) but the
     // engine's policy.childLeadsEnabled OFF. That's the same env var — they're tied today.
     // Solution: set the env var (satisfies prereq + childLeadsEnabled=true) and use seed
-    // with NO parent_lead_id so child_acquisition is the natural decision. Override below.
+    // with NO parent_opportunity_id so child_acquisition is the natural decision. Override below.
     process.env[`${FLAGS.LEAD_CARDINALITY_CHILD_LEADS}_TENANTS`] = '2';
 
     // To get enrich_only with the policy table as wired, we'd need policy.childLeadsEnabled=false.
@@ -231,7 +231,7 @@ describe('LB engine adapter — scenario 2: enrich existing lead (child OFF)', (
         name_token_set: 'linda mau', display_name: 'Linda Mau',
         sf_lead_id: 700, sf_customer_id: null,
       }],
-      leads: [{ id: 700, user_id: 2, parent_lead_id: null }],
+      leads: [{ id: 700, user_id: 2, parent_opportunity_id: null }],
     });
     const executors = makeExecutorSpies();
     const logger = makeLogger();
@@ -278,7 +278,7 @@ describe('LB engine adapter — scenario 3: child acquisition (child ON)', () =>
         name_token_set: 'linda mau', display_name: 'Linda Mau',
         sf_lead_id: 700, sf_customer_id: null,
       }],
-      leads: [{ id: 700, user_id: 2, parent_lead_id: null }], // canonical
+      leads: [{ id: 700, user_id: 2, parent_opportunity_id: null }], // canonical
     });
     const executors = makeExecutorSpies();
     const logger = makeLogger();
@@ -294,7 +294,7 @@ describe('LB engine adapter — scenario 3: child acquisition (child ON)', () =>
 
     expect(result.identity.id).toBe(50);
     expect(result.leadResult).toEqual(expect.objectContaining({
-      type: 'child_lead', id: 9002, parent_lead_id: 700, action: 'child_acquisition',
+      type: 'child_lead', id: 9002, parent_opportunity_id: 700, action: 'child_acquisition',
     }));
     expect(executors.createChildLeadFromLB).toHaveBeenCalledTimes(1);
     expect(executors.createChildLeadFromLB).toHaveBeenCalledWith(2, 700, expect.objectContaining({ id: 50 }), expect.any(Object));
@@ -444,7 +444,7 @@ describe('LB engine adapter — scenario 8: replay duplicate', () => {
 
     // Now seed identity with sf_lead_id to simulate the post-create state
     supabase._state.identities[0].sf_lead_id = 9001;
-    supabase._state.leads.push({ id: 9001, user_id: 2, parent_lead_id: null });
+    supabase._state.leads.push({ id: 9001, user_id: 2, parent_opportunity_id: null });
 
     // Second call — same lbContactId → resolver external_id match → enrich (no new lead)
     executors.createLeadFromLB.mockClear();
@@ -479,8 +479,8 @@ describe('LB engine adapter — scenario 9: grandchild refusal falls through to 
         name_token_set: 'diaz maria', display_name: 'Maria Diaz',
         sf_lead_id: 245, sf_customer_id: null,
       }],
-      // 245 is itself a child (parent_lead_id != null) → grandchild scenario
-      leads: [{ id: 245, user_id: 2, parent_lead_id: 100 }],
+      // 245 is itself a child (parent_opportunity_id != null) → grandchild scenario
+      leads: [{ id: 245, user_id: 2, parent_opportunity_id: 100 }],
     });
     const executors = makeExecutorSpies();
     const logger = makeLogger();

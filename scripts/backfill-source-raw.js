@@ -71,7 +71,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSessi
 
 async function loadMappingsForUser(userId) {
   const out = { leadbridge: {}, openphone: {} };
-  const { data } = await supabase.from('lead_source_mappings')
+  const { data } = await supabase.from('opportunity_source_mappings')
     .select('raw_value, source_name, provider')
     .eq('user_id', userId);
   for (const r of (data || [])) {
@@ -87,7 +87,7 @@ async function fetchLeadsNeedingBackfill(userId) {
   const out = [];
   let lastId = 0;
   for (;;) {
-    let q = supabase.from('leads')
+    let q = supabase.from('opportunities')
       .select('id, user_id, source, source_raw')
       .is('source_raw', null)
       .gt('id', lastId)
@@ -120,7 +120,7 @@ async function applyBatch(rows) {
     if (r.classification.action === 'remap_and_set_raw') {
       patch.source = r.classification.new_source;
     }
-    const { error } = await supabase.from('leads')
+    const { error } = await supabase.from('opportunities')
       .update(patch)
       .eq('id', r.id)
       .is('source_raw', null); // defensive — never overwrite an already-set raw

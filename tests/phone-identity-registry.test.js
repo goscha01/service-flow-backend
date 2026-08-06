@@ -502,7 +502,7 @@ describe('deleteOwner', () => {
     };
     const supabase = makeDeleteSupabase({ conflict });
     await deleteOwner(supabase, { log: jest.fn() }, 2, 1, 'lead', '67');
-    expect(supabase.captured.deletes[0].table).toBe('leads');
+    expect(supabase.captured.deletes[0].table).toBe('opportunities');
   });
 
   test('refuses unsupported entity_type (user)', async () => {
@@ -741,7 +741,7 @@ function makeEnrichSupabase({ customers = [], team_members = [], leads = [], use
     from: jest.fn((tbl) => {
       const rowsForTable = tbl === 'customers' ? customers
         : tbl === 'team_members' ? team_members
-        : tbl === 'leads' ? leads
+        : tbl === 'opportunities' ? leads
         : tbl === 'users' ? users
         : [];
       return {

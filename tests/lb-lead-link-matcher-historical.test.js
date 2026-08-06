@@ -47,7 +47,14 @@ const TENANT_ID = 2;
 // write path will be caught immediately.
 // ──────────────────────────────────────────────────────────────────────
 function makeStore({ leads = [], customers = [], jobs = [], lead_stages = [] } = {}) {
-  const rows = { leads, customers, jobs, lead_stages };
+  // After migration 076 the matcher queries the renamed tables. Alias
+  // both names to the same rows so existing test fixtures keep working.
+  const rows = {
+    leads, opportunities: leads,
+    customers,
+    jobs,
+    lead_stages, opportunity_stages: lead_stages,
+  };
 
   function applyFilters(data, filters) {
     return data.filter(r => filters.every(f => {

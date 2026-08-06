@@ -219,7 +219,7 @@ async function discoverTenants() {
   }
   from = 0;
   while (true) {
-    const { data } = await sf.from('leads').select('user_id').range(from, from + 999);
+    const { data } = await sf.from('opportunities').select('user_id').range(from, from + 999);
     if (!data || data.length === 0) break;
     for (const r of data) if (r.user_id) ids.add(r.user_id);
     if (data.length < 1000) break;
@@ -249,7 +249,7 @@ async function discoverTenants() {
     if (!tenantId && link.sfLeadId) {
       const lid = parseInt(link.sfLeadId, 10);
       if (!isNaN(lid)) {
-        const { data } = await sf.from('leads').select('user_id').eq('id', lid).maybeSingle();
+        const { data } = await sf.from('opportunities').select('user_id').eq('id', lid).maybeSingle();
         if (data) tenantId = data.user_id;
       }
     }
@@ -296,7 +296,7 @@ async function projectTenant(tenantId, lbUserUuidsForTenant) {
   // STEP 2 — SF leads (converted → existing Account, unconverted → resolve or new)
   process.stderr.write('  tenant ' + tenantId + ' • sf_leads… ');
   const sfLeads = await sfPaged(
-    'leads',
+    'opportunities',
     'id, first_name, last_name, phone, email, source, lb_external_request_id, converted_customer_id, created_at',
     q => q.eq('user_id', tenantId),
   );
