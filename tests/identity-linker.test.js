@@ -32,9 +32,9 @@ const {
  * Flexible mock that supports:
  *   - from('communication_participant_identities').update(...).eq(...).eq(...).or(...).select(...).maybeSingle()
  *   - from('communication_participant_identities').select(...).eq(...).eq(...).maybeSingle()
- *   - from('leads').update(...).eq(...).eq(...).is(...).select(...)
- *   - from('leads').select(...).eq(...).eq(...).maybeSingle()
- *   - from('leads').select(...).eq(...).eq(...).maybeSingle() (operator override path)
+ *   - from('opportunities').update(...).eq(...).eq(...).is(...).select(...)
+ *   - from('opportunities').select(...).eq(...).eq(...).maybeSingle()
+ *   - from('opportunities').select(...).eq(...).eq(...).maybeSingle() (operator override path)
  *   - from('customers').select(...).eq(...).maybeSingle()
  *   - from('identity_link_audit').insert(...)
  *   - rpc('pir_archive_entity', ...)
@@ -122,7 +122,7 @@ function makeSupabase({
           }),
         };
       }
-      if (table === 'leads') {
+      if (table === 'opportunities') {
         return {
           select: jest.fn(() => {
             let filterId = null;
@@ -197,7 +197,7 @@ function makeSupabase({
           }),
         };
       }
-      if (table === 'lead_stages' || table === 'lead_pipelines') {
+      if (table === 'opportunity_stages' || table === 'opportunity_pipelines') {
         // For stage-move branch; default empty.
         const t = {
           select: jest.fn(() => t),
@@ -238,7 +238,7 @@ describe('projectIdentityToCRM', () => {
 
   test('projects when both sides set and lead unconverted', async () => {
     const supabase = makeSupabase({
-      leads: [{ id: 10, user_id: 2, converted_customer_id: null, source: 'Thumbtack', lead_cost: 200 }],
+      leads: [{ id: 10, user_id: 2, converted_customer_id: null, source: 'Thumbtack', opportunity_cost: 200 }],
       customers: [{ id: 20, user_id: 2 }],
     });
     const logger = makeLogger();
@@ -308,18 +308,18 @@ describe('projectIdentityToCRM', () => {
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('lead already converted to 99'));
   });
 
-  test('I3/I4: source, lead_cost, created_at, pipeline_id never modified', async () => {
-    const lead = { id: 10, user_id: 2, converted_customer_id: null, source: 'Thumbtack Tampa', lead_cost: 200, created_at: '2026-01-01', pipeline_id: 7 };
+  test('I3/I4: source, opportunity_cost, created_at, pipeline_id never modified', async () => {
+    const lead = { id: 10, user_id: 2, converted_customer_id: null, source: 'Thumbtack Tampa', opportunity_cost: 200, created_at: '2026-01-01', pipeline_id: 7 };
     const supabase = makeSupabase({ leads: [lead], customers: [{ id: 20, user_id: 2 }] });
     await projectIdentityToCRM(supabase, makeLogger(), { id: 5, user_id: 2, sf_lead_id: 10, sf_customer_id: 20 });
     // Verify update patch only contains the three allowed columns.
     expect(Object.keys(supabase.captured.leadUpdates[0])).not.toContain('source');
-    expect(Object.keys(supabase.captured.leadUpdates[0])).not.toContain('lead_cost');
+    expect(Object.keys(supabase.captured.leadUpdates[0])).not.toContain('opportunity_cost');
     expect(Object.keys(supabase.captured.leadUpdates[0])).not.toContain('created_at');
     expect(Object.keys(supabase.captured.leadUpdates[0])).not.toContain('pipeline_id');
     // And on the lead itself the original values are preserved.
     expect(lead.source).toBe('Thumbtack Tampa');
-    expect(lead.lead_cost).toBe(200);
+    expect(lead.opportunity_cost).toBe(200);
     expect(lead.created_at).toBe('2026-01-01');
     expect(lead.pipeline_id).toBe(7);
   });

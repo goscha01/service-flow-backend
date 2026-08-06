@@ -6,7 +6,7 @@
  * Covers:
  *   1. Flag OFF: repeat acquisition enriches canonical (legacy preserved)
  *   2. Flag ON: repeat acquisition creates a child lead
- *   3. Child preserves its own source / lead_cost / created_at / notes
+ *   3. Child preserves its own source / opportunity_cost / created_at / notes
  *   4. Parent lead unchanged (canonical-side invariant)
  *   5. Identity row unchanged — sf_lead_id still points to canonical
  *      (this is the IDENTITY STABILITY invariant from correction #2)
@@ -17,7 +17,7 @@
  *  10. Reactivation case: existing customer + new LB → canonical lead
  *      tagged 'reactivation', SAME identity row
  *  11. ZB sync after child creation projects to canonical only
- *  12. Multiple children aggregate by person via canonical_lead_id
+ *  12. Multiple children aggregate by person via canonical_opportunity_id
  *  13. Communication history unchanged — children own no conversations
  *  14. OP-linked identity + new LB acquisition creates child without
  *      duplicating participant identities
@@ -25,7 +25,7 @@
 
 const path = require('path');
 const ingestionMod = require('../lib/lb-ingestion');
-const { groupByCanonical, personLevelCounts } = require('../lib/lead-aggregation');
+const { groupByCanonical, personLevelCounts } = require('../lib/opportunity-aggregation');
 
 // ── Test-double supabase ─────────────────────────────────────────────────
 //
@@ -48,7 +48,7 @@ function makeStore({ leads = [], identities = [] } = {}) {
     from(table) {
       const self = this;
       captured.queries.push({ table });
-      if (table === 'leads') {
+      if (table === 'opportunities') {
         return {
           select: (cols) => {
             let filterId = null;
@@ -58,7 +58,7 @@ function makeStore({ leads = [], identities = [] } = {}) {
               eq: function (col, val) {
                 if (col === 'id') filterId = val;
                 if (col === 'user_id') filterUser = val;
-                if (col === 'parent_lead_id') filterParent = val;
+                if (col === 'parent_opportunity_id') filterParent = val;
                 return t;
               },
               maybeSingle: async () => {
@@ -89,7 +89,7 @@ function makeStore({ leads = [], identities = [] } = {}) {
 
 // Inline reconstruction of createChildLeadFromLB (pure, no factory).
 async function createChildLeadFromLB({ supabase, logger, userId, parentLeadId, identity, input }) {
-  const { data: parent } = await supabase.from('leads').select('').eq('id', parentLeadId).eq('user_id', userId).maybeSingle();
+  const { data: parent } = await supabase.from('opportunities').select('').eq('id', parentLeadId).eq('user_id', userId).maybeSingle();
   try {
     ingestionMod.assertCreateChildLeadInvariant(parent, userId);
   } catch (e) {
@@ -106,7 +106,7 @@ async function createChildLeadFromLB({ supabase, logger, userId, parentLeadId, i
 
   const insertRow = {
     user_id: userId,
-    parent_lead_id: parent.id,
+    parent_opportunity_id: parent.id,
     pipeline_id: parent.pipeline_id,
     stage_id: parent.stage_id,
     first_name: firstName,
@@ -115,10 +115,10 @@ async function createChildLeadFromLB({ supabase, logger, userId, parentLeadId, i
     email: input.customerEmail || null,
     source,
     notes: input.message ? input.message.substring(0, 500) : null,
-    lead_origin_type: 'repeat_acquisition',
-    lead_cost: input.leadCost ?? null,
+    opportunity_origin_type: 'repeat_acquisition',
+    opportunity_cost: input.leadCost ?? null,
   };
-  const { data: newChild, error } = await supabase.from('leads').insert(insertRow).select().single();
+  const { data: newChild, error } = await supabase.from('opportunities').insert(insertRow).select().single();
   if (error) {
     logger.error(`[LB Lead] Child create error: ${error.message}`);
     return null;
@@ -136,12 +136,12 @@ function makeLogger() {
 describe('createChildLeadFromLB — happy path', () => {
   test('creates child lead, preserves attribution, leaves parent untouched', async () => {
     const parent = {
-      id: 67, user_id: 2, parent_lead_id: null,
+      id: 67, user_id: 2, parent_opportunity_id: null,
       pipeline_id: 9, stage_id: 33,
       first_name: 'Kira', last_name: 'Osipova',
       source: 'Spotless Homes Tampa (thumbtack)',
-      lead_cost: 200,
-      lead_origin_type: 'first_touch',
+      opportunity_cost: 200,
+      opportunity_origin_type: 'first_touch',
       created_at: '2026-01-15T10:00:00Z',
     };
     const identity = { id: 5, user_id: 2, sf_lead_id: 67, sf_customer_id: null };
@@ -158,17 +158,17 @@ describe('createChildLeadFromLB — happy path', () => {
     });
 
     expect(child).not.toBeNull();
-    expect(child.parent_lead_id).toBe(67);
+    expect(child.parent_opportunity_id).toBe(67);
     expect(child.pipeline_id).toBe(9);
     expect(child.stage_id).toBe(33); // snapshot of parent stage
     expect(child.source).toBe('Spotless Homes Tampa (yelp)'); // new source preserved
-    expect(child.lead_cost).toBe(150); // new cost preserved
-    expect(child.lead_origin_type).toBe('repeat_acquisition');
+    expect(child.opportunity_cost).toBe(150); // new cost preserved
+    expect(child.opportunity_origin_type).toBe('repeat_acquisition');
     expect(child.notes).toBe('recurring cleaning');
 
     // Parent unchanged (canonical-side invariant)
     expect(parent.source).toBe('Spotless Homes Tampa (thumbtack)');
-    expect(parent.lead_cost).toBe(200);
+    expect(parent.opportunity_cost).toBe(200);
     expect(parent.created_at).toBe('2026-01-15T10:00:00Z');
 
     // IDENTITY STABILITY invariant — identity untouched
@@ -184,7 +184,7 @@ describe('createChildLeadFromLB — happy path', () => {
     expect(linkLog).toMatch(/source=Spotless Homes Tampa \(yelp\)/);
 
     // Stage automation NOT fired — assert no lead_stage_automation_rules query happened
-    const automationQuery = supabase.captured.queries.find(q => q.table === 'lead_stage_automation_rules');
+    const automationQuery = supabase.captured.queries.find(q => q.table === 'opportunity_stage_automation_rules');
     expect(automationQuery).toBeUndefined();
   });
 });
@@ -196,7 +196,7 @@ describe('createChildLeadFromLB — invariant violations', () => {
     // assertion fires I-CL-1 (parent lead not found). The redundant I-CL-2
     // check in assertCreateChildLeadInvariant is still asserted directly in
     // tests/lb-ingestion.test.js (defense-in-depth).
-    const parent = { id: 67, user_id: 999, parent_lead_id: null };
+    const parent = { id: 67, user_id: 999, parent_opportunity_id: null };
     const identity = { id: 5, user_id: 2, sf_lead_id: 67 };
     const supabase = makeStore({ leads: [parent], identities: [identity] });
     const logger = makeLogger();
@@ -212,8 +212,8 @@ describe('createChildLeadFromLB — invariant violations', () => {
     expect(conflictLog).toMatch(/parent lead not found/);
   });
 
-  test('grandchild (parent itself has parent_lead_id) → null + conflict log', async () => {
-    const parent = { id: 245, user_id: 2, parent_lead_id: 67 };
+  test('grandchild (parent itself has parent_opportunity_id) → null + conflict log', async () => {
+    const parent = { id: 245, user_id: 2, parent_opportunity_id: 67 };
     const identity = { id: 5, user_id: 2, sf_lead_id: 245 };
     const supabase = makeStore({ leads: [parent], identities: [identity] });
     const logger = makeLogger();
@@ -249,7 +249,7 @@ describe('createChildLeadFromLB — invariant violations', () => {
 
 describe('IDENTITY STABILITY: child creation never touches identity row', () => {
   test('after child create, identity.sf_lead_id still points to canonical', async () => {
-    const parent = { id: 67, user_id: 2, parent_lead_id: null, pipeline_id: 9, stage_id: 33 };
+    const parent = { id: 67, user_id: 2, parent_opportunity_id: null, pipeline_id: 9, stage_id: 33 };
     const identity = { id: 5, user_id: 2, sf_lead_id: 67, sf_customer_id: 23421 };
     const initialIdentity = { ...identity };
     const supabase = makeStore({ leads: [parent], identities: [identity] });
@@ -272,7 +272,7 @@ describe('IDENTITY STABILITY: child creation never touches identity row', () => 
 
 describe('COMMUNICATION HISTORY belongs to identity, not lead', () => {
   test('child create does NOT touch communication_conversations or _identities', async () => {
-    const parent = { id: 67, user_id: 2, parent_lead_id: null, pipeline_id: 9, stage_id: 33 };
+    const parent = { id: 67, user_id: 2, parent_opportunity_id: null, pipeline_id: 9, stage_id: 33 };
     const identity = { id: 5, user_id: 2, sf_lead_id: 67 };
     const supabase = makeStore({ leads: [parent], identities: [identity] });
     const logger = makeLogger();
@@ -316,17 +316,17 @@ describe('Reactivation: existing customer gets new LB acquisition', () => {
 
 // ── Aggregation across canonical+children ────────────────────────────────
 
-describe('Per-person aggregation via canonical_lead_id', () => {
+describe('Per-person aggregation via canonical_opportunity_id', () => {
   test('multiple children + canonical group correctly', () => {
     const leads = [
-      { id: 67, parent_lead_id: null, source: 'Thumbtack', lead_cost: 200, created_at: '2026-01-01', lead_origin_type: 'first_touch', converted_customer_id: 23421 },
-      { id: 100, parent_lead_id: 67, source: 'Yelp', lead_cost: 150, created_at: '2026-03-01', lead_origin_type: 'repeat_acquisition' },
-      { id: 200, parent_lead_id: 67, source: 'Google', lead_cost: 75, created_at: '2026-09-01', lead_origin_type: 'repeat_acquisition' },
+      { id: 67, parent_opportunity_id: null, source: 'Thumbtack', opportunity_cost: 200, created_at: '2026-01-01', opportunity_origin_type: 'first_touch', converted_customer_id: 23421 },
+      { id: 100, parent_opportunity_id: 67, source: 'Yelp', opportunity_cost: 150, created_at: '2026-03-01', opportunity_origin_type: 'repeat_acquisition' },
+      { id: 200, parent_opportunity_id: 67, source: 'Google', opportunity_cost: 75, created_at: '2026-09-01', opportunity_origin_type: 'repeat_acquisition' },
     ];
     const groups = groupByCanonical(leads);
     expect(Object.keys(groups)).toEqual(['67']);
     expect(groups[67].acquisition_count).toBe(3);
-    expect(groups[67].total_lead_cost).toBe(425);
+    expect(groups[67].total_opportunity_cost).toBe(425);
     expect(groups[67].converted).toBe(true);
     expect(groups[67].converted_customer_id).toBe(23421);
     expect(groups[67].sources.sort()).toEqual(['Google', 'Thumbtack', 'Yelp']);
@@ -334,12 +334,12 @@ describe('Per-person aggregation via canonical_lead_id', () => {
 
   test('reactivation canonical counted separately from repeat acquisitions', () => {
     const leads = [
-      { id: 67, parent_lead_id: null, lead_origin_type: 'first_touch' },
-      { id: 100, parent_lead_id: 67, lead_origin_type: 'repeat_acquisition' },
+      { id: 67, parent_opportunity_id: null, opportunity_origin_type: 'first_touch' },
+      { id: 100, parent_opportunity_id: 67, opportunity_origin_type: 'repeat_acquisition' },
       // Reactivation = new canonical (different person? or same? in real life new
       // canonical for the same person via different identity context — but the
-      // canonical row is parent_lead_id NULL with origin=reactivation).
-      { id: 999, parent_lead_id: null, lead_origin_type: 'reactivation' },
+      // canonical row is parent_opportunity_id NULL with origin=reactivation).
+      { id: 999, parent_opportunity_id: null, opportunity_origin_type: 'reactivation' },
     ];
     const counts = personLevelCounts(leads);
     expect(counts.unique_people).toBe(2);
@@ -364,8 +364,8 @@ describe('ZB sync after child creation — projection touches canonical only', (
     // child leads. Tested directly in identity-linker.test.js. Here we
     // assert the layered model holds:
     const identity = { id: 5, user_id: 2, sf_lead_id: 67, sf_customer_id: null };
-    const canonical = { id: 67, parent_lead_id: null, converted_customer_id: null };
-    const child = { id: 100, parent_lead_id: 67, converted_customer_id: null };
+    const canonical = { id: 67, parent_opportunity_id: null, converted_customer_id: null };
+    const child = { id: 100, parent_opportunity_id: 67, converted_customer_id: null };
 
     // Simulated projection: only writes the lead pointed at by identity.sf_lead_id.
     const targetLeadId = identity.sf_lead_id;
@@ -389,7 +389,7 @@ describe('OP-linked identity + new LB acquisition', () => {
     // Identity already exists via OP (has sigcore_participant_id), and was
     // later linked to a canonical lead. New LB acquisition arrives. The
     // child-create path should NOT touch identities at all.
-    const parent = { id: 67, user_id: 2, parent_lead_id: null, pipeline_id: 9, stage_id: 33 };
+    const parent = { id: 67, user_id: 2, parent_opportunity_id: null, pipeline_id: 9, stage_id: 33 };
     const identityFromOP = {
       id: 5, user_id: 2,
       sigcore_participant_id: 'sig_abc',

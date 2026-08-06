@@ -71,10 +71,10 @@ function makeStub({ jobs = [], leads = [], customers = [], transactions = [], st
   function pick(table) {
     switch (table) {
       case 'jobs': return jobs;
-      case 'leads': return leads;
+      case 'opportunities': return leads;
       case 'customers': return customers;
       case 'transactions': return transactions;
-      case 'lead_stages': return stages;
+      case 'opportunity_stages': return stages;
       case 'leadbridge_outbound_events': return outbound;
       default: return [];
     }

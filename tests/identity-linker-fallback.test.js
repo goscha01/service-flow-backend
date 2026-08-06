@@ -50,7 +50,7 @@ function makeSupabase({
   return {
     captured,
     from: (table) => {
-      if (table === 'leads') {
+      if (table === 'opportunities') {
         const t = {
           _filters: {},
           select: jest.fn(function () { return t; }),

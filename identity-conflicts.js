@@ -308,7 +308,7 @@ module.exports = (supabase, logger) => {
       // Pull lead + customer (tenant-scoped).
       // updated_at included for the activeWindowHours safeguard.
       const [{ data: lead }, { data: customer }] = await Promise.all([
-        supabase.from('leads')
+        supabase.from('opportunities')
           .select('id, user_id, first_name, last_name, phone, source, converted_customer_id, normalized_name, name_token_set, updated_at')
           .eq('id', leadId).eq('user_id', userId).maybeSingle(),
         supabase.from('customers')

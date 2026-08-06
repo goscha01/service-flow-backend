@@ -21,7 +21,10 @@ const {
 // ─────────────────────────────────────────────────────────────────────
 function makeSupabase(state = {}) {
   state.identities ||= [];   // { id, user_id, sf_lead_id, sf_customer_id, status, last_hydrated_by, updated_at }
-  state.leads ||= [];        // { id, user_id, converted_customer_id, converted_at, updated_at, pipeline_id }
+  // Test data seeds `leads: [...]` for readability; the actual mock table
+  // lookup uses `opportunities` after migration 076. Alias so both work.
+  state.opportunities ||= state.leads || [];
+  state.leads = state.opportunities;
   state.customers ||= [];    // { id, user_id }
   state.audit ||= [];        // identity_link_audit rows (best-effort tracking)
   state.rpcCalls ||= [];
@@ -29,9 +32,9 @@ function makeSupabase(state = {}) {
   function table(name) {
     const rows = state[name === 'identity_link_audit' ? 'audit' :
                        name === 'communication_participant_identities' ? 'identities' :
-                       name === 'leads' ? 'leads' :
+                       name === 'opportunities' ? 'opportunities' :
                        name === 'customers' ? 'customers' :
-                       name === 'lead_stages' ? 'leadStages' :
+                       name === 'opportunity_stages' ? 'leadStages' :
                        null];
     const q = {
       _filters: [],

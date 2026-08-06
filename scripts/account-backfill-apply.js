@@ -256,7 +256,7 @@ async function setCustomerAccountId(customerId, accountId) {
 }
 async function setSfLeadAccountId(leadId, accountId) {
   if (DRY_RUN) return;
-  const { error } = await sf.from('leads').update({ account_id: accountId }).eq('id', leadId).is('account_id', null);
+  const { error } = await sf.from('opportunities').update({ account_id: accountId }).eq('id', leadId).is('account_id', null);
   if (error) throw new Error('UPDATE sf_lead.account_id failed: ' + error.message);
 }
 async function setLbLeadAccountId(lbLeadId, accountId) {
@@ -315,7 +315,7 @@ async function flagDuplicateConflicts() {
       if (!tid && link.sfLeadId) {
         const lid = parseInt(link.sfLeadId, 10);
         if (!isNaN(lid)) {
-          const { data } = await sf.from('leads').select('user_id').eq('id', lid).maybeSingle();
+          const { data } = await sf.from('opportunities').select('user_id').eq('id', lid).maybeSingle();
           if (data) tid = data.user_id;
         }
       }
@@ -373,7 +373,7 @@ async function flagDuplicateConflicts() {
   // ── STEP 2 — SF leads (converted attach, unconverted resolve-or-create) ──
   process.stderr.write('STEP 2 sf_leads… ');
   const sfLeads = await sfPaged(
-    'leads',
+    'opportunities',
     'id, first_name, last_name, phone, email, account_id, converted_customer_id, lb_external_request_id, created_at',
     q => q.eq('user_id', TENANT_ID).order('created_at', { ascending: true }),
     'created_at',
@@ -542,8 +542,8 @@ async function flagDuplicateConflicts() {
   if (!DRY_RUN) {
     const [{ count: cWith }] = await sfRpcCount('customers', 'user_id', TENANT_ID, true);
     const [{ count: cTotal }] = await sfRpcCount('customers', 'user_id', TENANT_ID, false);
-    const [{ count: lWith }] = await sfRpcCount('leads', 'user_id', TENANT_ID, true);
-    const [{ count: lTotal }] = await sfRpcCount('leads', 'user_id', TENANT_ID, false);
+    const [{ count: lWith }] = await sfRpcCount('opportunities', 'user_id', TENANT_ID, true);
+    const [{ count: lTotal }] = await sfRpcCount('opportunities', 'user_id', TENANT_ID, false);
     let lbWith = 0, lbTotal = 0;
     if (lbUserUuids.length > 0) {
       lbTotal = await lb.lead.count({ where: { userId: { in: lbUserUuids } } });

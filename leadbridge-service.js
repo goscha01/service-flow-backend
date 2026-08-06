@@ -412,7 +412,7 @@ module.exports = (supabase, logger) => {
   async function enrichLeadFromLB(userId, leadId, input) {
     // source_raw + lb_* are opportunistically filled by buildEnrichLeadPatch on
     // rows missing them; non-null lb_external_request_id is never overwritten.
-    const { data: existing } = await supabase.from('leads')
+    const { data: existing } = await supabase.from('opportunities')
       .select('id, source, source_raw, email, lb_external_request_id, lb_channel, lb_business_id, lb_provider_account_id')
       .eq('id', leadId).eq('user_id', userId).maybeSingle()
     if (!existing) return
@@ -437,24 +437,24 @@ module.exports = (supabase, logger) => {
 
     const patch = buildEnrichLeadPatch({ existing, input })
     if (!patch) return
-    await supabase.from('leads').update(patch).eq('id', leadId)
+    await supabase.from('opportunities').update(patch).eq('id', leadId)
   }
 
   async function createLeadFromLB(userId, identity, input) {
     const { channel, customerName, customerPhone, customerEmail, message, accountDisplayName, sourceMappingsLookup } = input
     assertCreateLeadInvariant(identity)
 
-    const { data: pipeline } = await supabase.from('lead_pipelines')
+    const { data: pipeline } = await supabase.from('opportunity_pipelines')
       .select('id').eq('user_id', userId).eq('is_default', true).maybeSingle()
     if (!pipeline) { logger.warn('[LB Lead] No default pipeline for user', userId); return null }
 
-    const { data: stages } = await supabase.from('lead_stages')
+    const { data: stages } = await supabase.from('opportunity_stages')
       .select('id, name, position').eq('pipeline_id', pipeline.id).order('position', { ascending: true })
     if (!stages?.length) { logger.warn('[LB Lead] No stages in default pipeline', pipeline.id); return null }
 
     let stage = stages[0]
     const eventType = message ? 'first_reply_sent' : 'lead_received'
-    const { data: rule } = await supabase.from('lead_stage_automation_rules')
+    const { data: rule } = await supabase.from('opportunity_stage_automation_rules')
       .select('target_stage_id').eq('user_id', userId).eq('event_type', eventType)
       .eq('enabled', true).in('channel', [channel, 'all']).limit(1).maybeSingle()
 
@@ -475,7 +475,7 @@ module.exports = (supabase, logger) => {
     // raw → leads.source_raw. Falls back to raw on both when no mapping.
     const { source, source_raw } = pickLBSources({ accountDisplayName, channel, sourceMappingsLookup })
 
-    // Phase 0.5: lead_origin_type written at create time.
+    // Phase 0.5: opportunity_origin_type written at create time.
     // reactivation = identity already has a customer (returning customer)
     // first_touch = no prior CRM link
     const isReactivation = !!identity.sf_customer_id
@@ -488,7 +488,7 @@ module.exports = (supabase, logger) => {
     // and the lead behaves like any other SF-native lead (no outbound).
     const lbLink = pickLbLink(input)
 
-    const { data: newLead, error } = await supabase.from('leads').insert({
+    const { data: newLead, error } = await supabase.from('opportunities').insert({
       user_id: userId,
       pipeline_id: pipeline.id,
       stage_id: stage.id,
@@ -499,7 +499,7 @@ module.exports = (supabase, logger) => {
       source,
       source_raw,
       notes: message ? message.substring(0, 500) : null,
-      lead_origin_type: leadOriginType,
+      opportunity_origin_type: leadOriginType,
       lb_external_request_id: lbLink.lb_external_request_id,
       lb_channel: lbLink.lb_channel,
       lb_business_id: lbLink.lb_business_id,
@@ -541,8 +541,8 @@ module.exports = (supabase, logger) => {
   async function createChildLeadFromLB(userId, parentLeadId, identity, input) {
     const { channel, customerName, customerPhone, customerEmail, message, accountDisplayName, sourceMappingsLookup } = input
     // Fetch parent for invariant checks + pipeline/stage snapshot.
-    const { data: parent } = await supabase.from('leads')
-      .select('id, user_id, parent_lead_id, pipeline_id, stage_id, source')
+    const { data: parent } = await supabase.from('opportunities')
+      .select('id, user_id, parent_opportunity_id, pipeline_id, stage_id, source')
       .eq('id', parentLeadId).eq('user_id', userId).maybeSingle()
 
     try {
@@ -575,9 +575,9 @@ module.exports = (supabase, logger) => {
     // correct LB-side target for that acquisition.
     const lbLink = pickLbLink(input)
 
-    const { data: newChild, error } = await supabase.from('leads').insert({
+    const { data: newChild, error } = await supabase.from('opportunities').insert({
       user_id: userId,
-      parent_lead_id: parent.id,
+      parent_opportunity_id: parent.id,
       pipeline_id: parent.pipeline_id,
       stage_id: parent.stage_id,
       first_name: firstName,
@@ -587,7 +587,7 @@ module.exports = (supabase, logger) => {
       source,
       source_raw,
       notes: message ? message.substring(0, 500) : null,
-      lead_origin_type: 'repeat_acquisition',
+      opportunity_origin_type: 'repeat_acquisition',
       lb_external_request_id: lbLink.lb_external_request_id,
       lb_channel: lbLink.lb_channel,
       lb_business_id: lbLink.lb_business_id,
@@ -612,11 +612,11 @@ module.exports = (supabase, logger) => {
     // Identity already tied to a lead.
     if (identity.sf_lead_id) {
       // Phase 0.5: when child-leads flag ON, preserve repeat acquisition as
-      // a child lead (parent_lead_id = canonical). When OFF, legacy enrich.
+      // a child lead (parent_opportunity_id = canonical). When OFF, legacy enrich.
       if (isEnabledForTenant(FLAGS.LEAD_CARDINALITY_CHILD_LEADS, userId)) {
         const child = await createChildLeadFromLB(userId, identity.sf_lead_id, identity, input)
         if (child) {
-          return { type: 'child_lead', id: child.id, parent_lead_id: identity.sf_lead_id, created: true, action: 'child_acquisition' }
+          return { type: 'child_lead', id: child.id, parent_opportunity_id: identity.sf_lead_id, created: true, action: 'child_acquisition' }
         }
         // Child create failed (e.g., invariant violation) — fall through to legacy enrich.
       }
@@ -694,7 +694,7 @@ module.exports = (supabase, logger) => {
         return { type: 'customer', id: customer.id, created: false, action: 'linked_customer' }
       }
 
-      const { data: existingLead } = await supabase.from('leads')
+      const { data: existingLead } = await supabase.from('opportunities')
         .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
       if (existingLead) {
         await setIdentityLead(supabase, logger, {
@@ -763,23 +763,23 @@ module.exports = (supabase, logger) => {
 
     try {
       // Get the lead's current stage
-      const { data: lead } = await supabase.from('leads')
+      const { data: lead } = await supabase.from('opportunities')
         .select('id, stage_id, converted_customer_id').eq('id', leadId).eq('user_id', userId).maybeSingle()
       if (!lead || lead.converted_customer_id) return // Already converted, skip
 
       // Get the current stage position
-      const { data: currentStage } = await supabase.from('lead_stages')
+      const { data: currentStage } = await supabase.from('opportunity_stages')
         .select('id, position').eq('id', lead.stage_id).maybeSingle()
 
       // Find matching rule: try channel-specific first, then 'all'
       let rule = null
-      const { data: channelRule } = await supabase.from('lead_stage_automation_rules')
+      const { data: channelRule } = await supabase.from('opportunity_stage_automation_rules')
         .select('*').eq('user_id', userId).eq('channel', channel).eq('event_type', eventType)
         .eq('enabled', true).maybeSingle()
       rule = channelRule
 
       if (!rule) {
-        const { data: allRule } = await supabase.from('lead_stage_automation_rules')
+        const { data: allRule } = await supabase.from('opportunity_stage_automation_rules')
           .select('*').eq('user_id', userId).eq('channel', 'all').eq('event_type', eventType)
           .eq('enabled', true).maybeSingle()
         rule = allRule
@@ -788,7 +788,7 @@ module.exports = (supabase, logger) => {
       if (!rule) return // No rule for this event
 
       // Get target stage position
-      const { data: targetStage } = await supabase.from('lead_stages')
+      const { data: targetStage } = await supabase.from('opportunity_stages')
         .select('id, position, name').eq('id', rule.target_stage_id).maybeSingle()
       if (!targetStage) return
 
@@ -796,7 +796,7 @@ module.exports = (supabase, logger) => {
       if (currentStage && targetStage.position <= currentStage.position) return
 
       // Update lead stage
-      await supabase.from('leads').update({
+      await supabase.from('opportunities').update({
         stage_id: targetStage.id,
         updated_at: new Date().toISOString(),
       }).eq('id', leadId)

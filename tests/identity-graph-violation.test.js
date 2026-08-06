@@ -34,8 +34,8 @@ function makeLogger() {
 describe('VIOLATION_KINDS catalogue', () => {
   test('all canonical kinds defined', () => {
     expect(VIOLATION_KINDS.DIRECT_CONVERTED_CUSTOMER_ID_WRITE).toBe('direct_converted_customer_id_write');
-    expect(VIOLATION_KINDS.DIRECT_PARENT_LEAD_ID_WRITE).toBe('direct_parent_lead_id_write');
-    expect(VIOLATION_KINDS.DIRECT_LEAD_ORIGIN_TYPE_WRITE).toBe('direct_lead_origin_type_write');
+    expect(VIOLATION_KINDS.DIRECT_PARENT_LEAD_ID_WRITE).toBe('direct_parent_opportunity_id_write');
+    expect(VIOLATION_KINDS.DIRECT_LEAD_ORIGIN_TYPE_WRITE).toBe('direct_opportunity_origin_type_write');
     expect(VIOLATION_KINDS.DIRECT_SF_LEAD_ID_WRITE).toBe('direct_sf_lead_id_write');
     expect(VIOLATION_KINDS.DIRECT_SF_CUSTOMER_ID_WRITE).toBe('direct_sf_customer_id_write');
     expect(VIOLATION_KINDS.DIRECT_IDENTITY_PROJECTION_WRITE).toBe('direct_identity_projection_write');

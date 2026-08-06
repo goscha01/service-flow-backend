@@ -53,7 +53,7 @@ function makeSupabaseStub({ leads = [], identities = [] } = {}) {
       return chain;
 
       function rowsFor(t) {
-        if (t === 'leads') return leads;
+        if (t === 'opportunities') return leads;
         if (t === 'communication_participant_identities') return identities;
         return [];
       }

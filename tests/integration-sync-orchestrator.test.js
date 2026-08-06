@@ -61,8 +61,8 @@ function mockSupabase({ customers = [], leads = [], sourceMappings = [], convers
   return {
     from(tbl) {
       if (tbl === 'customers') return tableChain(customers);
-      if (tbl === 'leads') return tableChain(leads);
-      if (tbl === 'lead_source_mappings') return tableChain(sourceMappings);
+      if (tbl === 'opportunities') return tableChain(leads);
+      if (tbl === 'opportunity_source_mappings') return tableChain(sourceMappings);
       if (tbl === 'communication_conversations') return tableChain(conversations);
       if (tbl === 'communication_identity_ambiguities') {
         return {

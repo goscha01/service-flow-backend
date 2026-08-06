@@ -229,22 +229,22 @@ describe('assertCreateChildLeadInvariant — Phase 0.5', () => {
   });
 
   test('I-CL-2: throws on cross-tenant parent', () => {
-    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: 999, parent_lead_id: null }, 2))
+    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: 999, parent_opportunity_id: null }, 2))
       .toThrow(/cross-tenant parent/);
   });
 
   test('I-CL-2: matches numeric vs string user_id safely', () => {
-    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: '2', parent_lead_id: null }, 2))
+    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: '2', parent_opportunity_id: null }, 2))
       .not.toThrow();
   });
 
   test('I-CL-3: throws when parent is itself a child (no grandchildren)', () => {
-    expect(() => assertCreateChildLeadInvariant({ id: 245, user_id: 2, parent_lead_id: 67 }, 2))
+    expect(() => assertCreateChildLeadInvariant({ id: 245, user_id: 2, parent_opportunity_id: 67 }, 2))
       .toThrow(/parent is itself a child/);
   });
 
   test('happy path: parent is canonical, same tenant', () => {
-    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: 2, parent_lead_id: null }, 2))
+    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: 2, parent_opportunity_id: null }, 2))
       .not.toThrow();
   });
 });

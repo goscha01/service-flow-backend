@@ -100,7 +100,7 @@ async function main() {
 
   const [leadsRows, custRows, stagesRows, openTasksRows, jobsAggRows, futureJobsRows, recentConvRows, otherPhoneOwnersRows] = await Promise.all([
     sql(`SELECT id, user_id, first_name, last_name, phone, source, converted_customer_id,
-                normalized_name, name_token_set, lead_cost, updated_at, created_at,
+                normalized_name, name_token_set, opportunity_cost, updated_at, created_at,
                 pipeline_id, stage_id, notes
            FROM leads
           WHERE user_id = ${USER_ID} AND id IN (${leadIds.join(',')})`),
@@ -308,7 +308,7 @@ async function main() {
         stage_id: lead.stage_id,
         stage_name: stageName,
         notes_excerpt: lead.notes ? String(lead.notes).slice(0, 120) : null,
-        lead_cost: lead.lead_cost,
+        opportunity_cost: lead.opportunity_cost,
       },
       customer: {
         id: customerId,
@@ -438,7 +438,7 @@ function renderMarkdown(summary, packet) {
     lines.push(`- Created: ${p.lead.created_at} (${p.lead.created_ago})`);
     lines.push(`- Updated: ${p.lead.updated_at} (${p.lead.updated_ago})`);
     if (p.lead.notes_excerpt) lines.push(`- Notes excerpt: \`${p.lead.notes_excerpt}…\``);
-    if (p.lead.lead_cost != null) lines.push(`- Lead cost: ${p.lead.lead_cost}`);
+    if (p.lead.opportunity_cost != null) lines.push(`- Lead cost: ${p.lead.opportunity_cost}`);
     lines.push('');
     lines.push(`**Customer #${p.customer_id}**`);
     lines.push(`- Name: \`${p.customer.name || '—'}\``);

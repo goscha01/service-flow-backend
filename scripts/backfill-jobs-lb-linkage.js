@@ -143,7 +143,7 @@ async function fetchLeadsForCustomers(supabase, userId, customerIds) {
   for (let i = 0; i < customerIds.length; i += 200) {
     const slice = customerIds.slice(i, i + 200);
     const { data, error } = await supabase
-      .from('leads')
+      .from('opportunities')
       .select('id, user_id, converted_customer_id, lb_external_request_id, lb_channel, lb_business_id, lb_provider_account_id')
       .eq('user_id', userId)
       .in('converted_customer_id', slice);

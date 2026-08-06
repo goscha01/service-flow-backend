@@ -122,7 +122,7 @@ async function main() {
 
     const [leadRows, custRows] = await Promise.all([
       sql(`SELECT id, user_id, first_name, last_name, phone, source, converted_customer_id,
-                  normalized_name, name_token_set, lead_cost, updated_at
+                  normalized_name, name_token_set, opportunity_cost, updated_at
              FROM leads WHERE id = ${leadId} AND user_id = ${USER_ID} LIMIT 1`),
       sql(`SELECT id, user_id, first_name, last_name, phone, source,
                   normalized_name, name_token_set, updated_at
@@ -262,7 +262,7 @@ async function main() {
       customer_name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
       lead_source: lead.source,
       customer_source: customer.source,
-      lead_cost: lead.lead_cost,
+      opportunity_cost: lead.opportunity_cost,
       lead_updated_at: lead.updated_at || null,
       customer_updated_at: customer.updated_at || null,
       conflicting_identity_rows: conflictingIdentities,
