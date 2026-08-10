@@ -49,6 +49,7 @@ const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 const { startReconcileCron: startZbFutureReconcileCron } = require('./workers/zb-future-reconcile-cron');
+const { startAvailabilityReconcileCron: startZbAvailabilityReconcileCron } = require('./workers/zb-availability-reconcile-cron');
 const { updateJobStatus: jobStatusServiceUpdate } = require('./services/job-status-service');
 const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
 const { startDrainer: startLbOrchestrationWebhookDrainer } = require('./workers/lb-orchestration-webhook-drainer');
@@ -38593,6 +38594,18 @@ app.listen(PORT, async () => {
     startZbFutureReconcileCron({ supabase, logger, updateJobStatusFn: jobStatusServiceUpdate });
   } catch (e) {
     logger.error(`[ZBFutureReconcileCron] Failed to start: ${e.message}`);
+  }
+
+  // ZB team-member availability reconciliation cron. Nightly pull of provider
+  // /timeslots per tenant, folded into team_members.availability.customAvailability.
+  // Multi-layered gating: ZB_AVAIL_RECONCILE_ENABLED must be 'true' to run at
+  // all; ZB_AVAIL_RECONCILE_APPLY must be 'true' for writes (else dry-run).
+  // Optional per-tenant allowlist via ZB_AVAIL_RECONCILE_TENANTS. See
+  // workers/zb-availability-reconcile-cron.js for env var details.
+  try {
+    startZbAvailabilityReconcileCron({ supabase, logger });
+  } catch (e) {
+    logger.error(`[ZBAvailabilityReconcileCron] Failed to start: ${e.message}`);
   }
 
   // S4 — Orchestration webhook outbox drainer.
