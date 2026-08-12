@@ -1036,7 +1036,7 @@ module.exports = (supabase, logger) => {
       .select(`
         id, status, service_name,
         scheduled_date, scheduled_time, created_at,
-        team_member_id,
+        team_member_id, customer_id,
         service_address_street, service_address_city,
         service_address_state, service_address_zip,
         customers!left ( first_name, last_name )
@@ -1163,25 +1163,92 @@ module.exports = (supabase, logger) => {
       }
     }
 
+    // ── First-job flags via a single RPC (see migration 077). For each
+    //    (workspace, customer) on this page, the RPC returns the
+    //    earliest non-cancelled (scheduled_date, id). A page row is the
+    //    customer's first real job iff its own status != 'cancelled'
+    //    AND (scheduled_date, id) matches the earliest for its customer.
+    //
+    //    Cancelled jobs never consume the "first" slot: if the
+    //    customer's earliest booking was cancelled, the next non-
+    //    cancelled job becomes first. This matches ProofPix's
+    //    "New customers only" auto-create semantics.
+    //
+    //    Batched — one RPC per page regardless of customer count.
+    //    Non-fatal: on failure, is_first_job_for_customer is null for
+    //    every row and the mobile client's "new_customers" policy
+    //    fails safely (no auto-create instead of guessing).
+    const pageCustomerIds = [
+      ...new Set(pageRows.map((r) => r.customer_id).filter((c) => Number.isFinite(c))),
+    ];
+    const earliestByCustomer = new Map();
+    if (pageCustomerIds.length > 0) {
+      const { data: firstRows, error: firstErr } = await supabase
+        .rpc('proofpix_customer_first_job', {
+          p_user_id: userId,
+          p_customer_ids: pageCustomerIds,
+        });
+      if (firstErr) {
+        log.warn('[ProofPix] proofpix_customer_first_job rpc failed:', firstErr.message);
+      } else {
+        for (const row of firstRows || []) {
+          if (row?.customer_id == null) continue;
+          earliestByCustomer.set(Number(row.customer_id), {
+            d: row.scheduled_date,
+            i: Number(row.job_id),
+          });
+        }
+      }
+    }
+
     // ── Shape response ──────────────────────────────────────────────
-    const jobs = pageRows.map((j) => ({
-      id: String(j.id),
-      title: j.service_name && String(j.service_name).trim()
-        ? String(j.service_name).trim()
-        : `Job #${j.id}`,
-      customer_name: customerName(j.customers),
-      address: joinAddress(j),
-      status: bucketStatus(j.status),
-      scheduled_at: scheduledAtMs(j),
-      photo_count: countsByJobId[j.id] || 0,
-      // Primary assignee — jobs.team_member_id (legacy single-
-      // assignee column). Null when unassigned. Distinct from
-      // team_member_ids below, which is the multi-assignee join.
-      team_member_id: j.team_member_id != null ? Number(j.team_member_id) : null,
-      // All assignees via job_team_assignments (may be empty even
-      // when team_member_id is set — the two aren't synced).
-      team_member_ids: teamMemberIdsByJobId.get(Number(j.id)) || [],
-    }));
+    const jobs = pageRows.map((j) => {
+      const custId = j.customer_id != null ? Number(j.customer_id) : null;
+      const earliest = custId != null ? earliestByCustomer.get(custId) : null;
+      // Only mark first when we actually got RPC data back — a null
+      // means the helper failed and the mobile client must not guess.
+      // The RPC always returns a row for every non-empty customer_id
+      // with at least one non-cancelled job, so a missing entry when
+      // the RPC succeeded means "customer has zero non-cancelled jobs"
+      // (impossible while THIS job is non-cancelled), which we treat
+      // conservatively as null.
+      let isFirst = null;
+      if (custId != null && pageCustomerIds.length > 0) {
+        if (j.status === 'cancelled') {
+          isFirst = false;
+        } else if (earliest) {
+          isFirst = earliest.d === j.scheduled_date && earliest.i === Number(j.id);
+        }
+      }
+      return {
+        id: String(j.id),
+        title: j.service_name && String(j.service_name).trim()
+          ? String(j.service_name).trim()
+          : `Job #${j.id}`,
+        customer_name: customerName(j.customers),
+        // Stable SF customer identifier — exposed so ProofPix can key
+        // its "New customers only" logic on an authoritative id
+        // instead of the display name (which can collide / rename).
+        // Null when the job has no customer linkage (rare).
+        customer_id: custId,
+        // Set-based first-job flag; see migration 077 for the rule.
+        // null when the RPC failed OR when this job has no customer_id
+        // — mobile client's "new_customers" policy treats null as
+        // "unknown, do not auto-create" (fail-safe).
+        is_first_job_for_customer: isFirst,
+        address: joinAddress(j),
+        status: bucketStatus(j.status),
+        scheduled_at: scheduledAtMs(j),
+        photo_count: countsByJobId[j.id] || 0,
+        // Primary assignee — jobs.team_member_id (legacy single-
+        // assignee column). Null when unassigned. Distinct from
+        // team_member_ids below, which is the multi-assignee join.
+        team_member_id: j.team_member_id != null ? Number(j.team_member_id) : null,
+        // All assignees via job_team_assignments (may be empty even
+        // when team_member_id is set — the two aren't synced).
+        team_member_ids: teamMemberIdsByJobId.get(Number(j.id)) || [],
+      };
+    });
 
     return res.status(200).json({ jobs, next_cursor: nextCursor });
   });
