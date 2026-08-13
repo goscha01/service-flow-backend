@@ -28,6 +28,7 @@ const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
 const { recordZbImportAmbiguity, reconcileOrphans } = require('./lib/zb-orphan-reconciliation')
 const { normalizePhone: normalizePhoneCanon } = require('./lib/name-normalize')
 const { upsertTeamMemberProviderMappingFromZbSync } = require('./lib/team-member-provider-mapping')
+const { buildAvailabilityFromZb } = require('./lib/zenbooker-team-availability')
 const { reconcileRecurringBooking } = require('./lib/zb-future-reconciler')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
@@ -139,7 +140,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
   function mapTeamMember(zb, userId) {
     const nameParts = (zb.name || '').split(' ')
-    return {
+    const mapped = {
       user_id: userId,
       first_name: nameParts[0] || '',
       last_name: nameParts.slice(1).join(' ') || '',
@@ -148,6 +149,13 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       zenbooker_id: zb.id,
       salary_start_date: null, // Explicit null: DB default is CURRENT_DATE which breaks payroll for historical jobs
     }
+    // Availability from ZB's raw recurring_hours + date_overrides. Fresh
+    // inserts get a clean payload (no manual entries to preserve yet); the
+    // update branch in syncTeamMembers passes existingAvailability so
+    // manual customAvailability entries survive.
+    const zbAvail = buildAvailabilityFromZb(zb)
+    if (zbAvail) mapped.availability = zbAvail
+    return mapped
   }
 
   function mapCustomer(zb, userId) {
@@ -655,12 +663,12 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     // Pre-fetch account owner email to avoid creating team members with owner's email
     const { data: ownerData } = await supabase.from('users').select('email').eq('id', userId).single()
     const ownerEmail = (ownerData?.email || '').toLowerCase().trim()
-    let created = 0, skipped = 0, errors = 0, mappingsUpserted = 0, deactivated = 0
+    let created = 0, skipped = 0, errors = 0, mappingsUpserted = 0, deactivated = 0, availabilityUpdated = 0
     const seenZbIds = new Set()
     for (const zb of zbTeam) {
       if (!zb || !zb.id) continue
       seenZbIds.add(String(zb.id))
-      const { data: existing } = await supabase.from('team_members').select('id, status').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+      const { data: existing } = await supabase.from('team_members').select('id, status, availability').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
       if (existing) {
         skipped++
         // Defensive: refresh the outbound mapping registry for already-known
@@ -680,6 +688,20 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             .update({ status: 'active', updated_at: new Date().toISOString() })
             .eq('id', existing.id)
           logger.log(`[Zenbooker] Reactivated team_member ${existing.id} (zenbooker_id=${zb.id}) — present in ZB again`)
+        }
+        // Availability sync — ZB's recurring_hours + date_overrides are the
+        // source of truth for connected tenants. Merge preserves manual
+        // customAvailability entries (source unset).
+        const nextAvail = buildAvailabilityFromZb(zb, existing.availability)
+        if (nextAvail && JSON.stringify(nextAvail) !== JSON.stringify(existing.availability || null)) {
+          const { error: availErr } = await supabase.from('team_members')
+            .update({ availability: nextAvail, updated_at: new Date().toISOString() })
+            .eq('id', existing.id)
+          if (availErr) {
+            logger.warn(`[Zenbooker] Availability update failed for team_member ${existing.id}: ${availErr.message}`)
+          } else {
+            availabilityUpdated++
+          }
         }
         continue
       }
@@ -766,7 +788,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       }
     }
 
-    return { total: zbTeam.length, created, skipped, errors, mappingsUpserted, deactivated }
+    return { total: zbTeam.length, created, skipped, errors, mappingsUpserted, deactivated, availabilityUpdated }
   }
 
   async function syncCustomers(userId, apiKey) {
