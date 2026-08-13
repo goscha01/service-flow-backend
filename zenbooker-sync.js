@@ -738,15 +738,21 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           && !seenZbIds.has(String(m.zenbooker_id))
           && !PROTECTED_ROLES.has(String(m.role || '').toLowerCase())
         )
-        // 50% threshold — looser than the customer path's 10% because ZB team
-        // rosters churn much less than customer lists, and the initial cleanup
-        // after we started filtering by user_status legitimately deactivates
-        // 60-80% of previously-mirrored providers on some workspaces. 50%
-        // still catches a catastrophic ZB API returning near-empty responses.
+        // 80% threshold — loose enough for the one-time cleanup after we
+        // began filtering by user_status (workspaces routinely accumulate
+        // 60-80% deactivated-in-ZB rows before the filter shipped). Still
+        // catches a fully-broken ZB API returning ~zero rows: that scenario
+        // hits 100%, above the guard. On steady state, subsequent syncs
+        // move 1-2 rows at a time — well below any threshold. Also log a
+        // warning when the ratio crosses 50% so operators notice unusual
+        // churn without the operation being blocked.
         const ratio = sfZbTeam.length > 0 ? toDeactivate.length / sfZbTeam.length : 0
-        if (ratio > 0.5) {
-          logger.warn(`[Zenbooker] Team deactivation-detection aborted: would deactivate ${toDeactivate.length}/${sfZbTeam.length} (${(ratio*100).toFixed(1)}%) — sanity threshold 50% exceeded. Skipping to avoid mass-deactivation.`)
+        if (ratio > 0.8) {
+          logger.warn(`[Zenbooker] Team deactivation-detection aborted: would deactivate ${toDeactivate.length}/${sfZbTeam.length} (${(ratio*100).toFixed(1)}%) — sanity threshold 80% exceeded. Skipping to avoid mass-deactivation.`)
         } else if (toDeactivate.length > 0) {
+          if (ratio > 0.5) {
+            logger.warn(`[Zenbooker] Team deactivation ratio unusually high — deactivating ${toDeactivate.length}/${sfZbTeam.length} (${(ratio*100).toFixed(1)}%). Proceeding (below the 80% abort threshold).`)
+          }
           for (const m of toDeactivate) {
             await supabase.from('team_members')
               .update({ status: 'inactive', updated_at: new Date().toISOString() })
