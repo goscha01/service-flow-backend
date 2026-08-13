@@ -628,7 +628,30 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
   }
 
   async function syncTeamMembers(userId, apiKey) {
-    const zbTeam = await zbFetchAll(apiKey, '/team_members')
+    const zbTeamRaw = await zbFetchAll(apiKey, '/team_members')
+    // ZB's /team_members endpoint returns EVERY provider ever created — active,
+    // invited, and deactivated. The `user_status` field discriminates. Without
+    // this filter, an operator with 16 active cleaners in the ZB dashboard was
+    // getting 59 rows back and SF was re-inserting/reactivating the 43 deactivated
+    // ones every sync. Denylist the known "no longer working" states; keep
+    // 'active', 'invited', and any unrecognized/absent status (the latter two
+    // are defensive — a new ZB status we haven't seen shouldn't be silently
+    // dropped without an operator noticing via the diagnostic log below).
+    const INACTIVE_ZB_STATUSES = new Set([
+      'deactivated', 'disabled', 'inactive', 'removed', 'archived', 'deleted', 'suspended'
+    ])
+    const statusCounts = {}
+    for (const zb of zbTeamRaw) {
+      const s = String(zb?.user_status ?? '').toLowerCase() || '(unset)'
+      statusCounts[s] = (statusCounts[s] || 0) + 1
+    }
+    logger.log(`[Zenbooker] /team_members raw=${zbTeamRaw.length} user_status counts=${JSON.stringify(statusCounts)}`)
+    const zbTeam = zbTeamRaw.filter(zb =>
+      !INACTIVE_ZB_STATUSES.has(String(zb?.user_status ?? '').toLowerCase())
+    )
+    if (zbTeam.length !== zbTeamRaw.length) {
+      logger.log(`[Zenbooker] /team_members filtered to ${zbTeam.length} active (${zbTeamRaw.length - zbTeam.length} excluded by user_status)`)
+    }
     // Pre-fetch account owner email to avoid creating team members with owner's email
     const { data: ownerData } = await supabase.from('users').select('email').eq('id', userId).single()
     const ownerEmail = (ownerData?.email || '').toLowerCase().trim()
@@ -715,10 +738,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           && !seenZbIds.has(String(m.zenbooker_id))
           && !PROTECTED_ROLES.has(String(m.role || '').toLowerCase())
         )
-        // Same 10% sanity threshold as the customer path.
+        // 50% threshold — looser than the customer path's 10% because ZB team
+        // rosters churn much less than customer lists, and the initial cleanup
+        // after we started filtering by user_status legitimately deactivates
+        // 60-80% of previously-mirrored providers on some workspaces. 50%
+        // still catches a catastrophic ZB API returning near-empty responses.
         const ratio = sfZbTeam.length > 0 ? toDeactivate.length / sfZbTeam.length : 0
-        if (ratio > 0.1) {
-          logger.warn(`[Zenbooker] Team deactivation-detection aborted: would deactivate ${toDeactivate.length}/${sfZbTeam.length} (${(ratio*100).toFixed(1)}%) — sanity threshold 10% exceeded. Skipping to avoid mass-deactivation.`)
+        if (ratio > 0.5) {
+          logger.warn(`[Zenbooker] Team deactivation-detection aborted: would deactivate ${toDeactivate.length}/${sfZbTeam.length} (${(ratio*100).toFixed(1)}%) — sanity threshold 50% exceeded. Skipping to avoid mass-deactivation.`)
         } else if (toDeactivate.length > 0) {
           for (const m of toDeactivate) {
             await supabase.from('team_members')

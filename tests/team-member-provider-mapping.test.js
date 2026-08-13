@@ -381,7 +381,7 @@ describe('zenbooker-sync.js integration', () => {
     expect(fnStart).toBeGreaterThan(-1);
     // Slice through end of function — find the next `async function` at the
     // same indentation level, or end of file.
-    const fnSlice = ZB_SYNC_JS.slice(fnStart, fnStart + 4000);
+    const fnSlice = ZB_SYNC_JS.slice(fnStart, fnStart + 6000);
     const matches = fnSlice.match(/upsertTeamMemberProviderMappingFromZbSync/g);
     expect(matches).not.toBeNull();
     expect(matches.length).toBeGreaterThanOrEqual(2);
