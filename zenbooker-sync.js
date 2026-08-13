@@ -632,10 +632,12 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     // Pre-fetch account owner email to avoid creating team members with owner's email
     const { data: ownerData } = await supabase.from('users').select('email').eq('id', userId).single()
     const ownerEmail = (ownerData?.email || '').toLowerCase().trim()
-    let created = 0, skipped = 0, errors = 0, mappingsUpserted = 0
+    let created = 0, skipped = 0, errors = 0, mappingsUpserted = 0, deactivated = 0
+    const seenZbIds = new Set()
     for (const zb of zbTeam) {
       if (!zb || !zb.id) continue
-      const { data: existing } = await supabase.from('team_members').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+      seenZbIds.add(String(zb.id))
+      const { data: existing } = await supabase.from('team_members').select('id, status').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
       if (existing) {
         skipped++
         // Defensive: refresh the outbound mapping registry for already-known
@@ -648,6 +650,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           isActive: true,
         })
         if (mapRes && mapRes.mode === 'upserted') mappingsUpserted++
+        // Re-activate if ZB brought them back after a previous deactivation
+        // (mirror of the deletion-detection step below).
+        if (existing.status === 'inactive') {
+          await supabase.from('team_members')
+            .update({ status: 'active', updated_at: new Date().toISOString() })
+            .eq('id', existing.id)
+          logger.log(`[Zenbooker] Reactivated team_member ${existing.id} (zenbooker_id=${zb.id}) — present in ZB again`)
+        }
         continue
       }
       const mapped = mapTeamMember(zb, userId)
@@ -676,7 +686,54 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         if (mapRes && mapRes.mode === 'upserted') mappingsUpserted++
       }
     }
-    return { total: zbTeam.length, created, skipped, errors, mappingsUpserted }
+
+    // Detect deactivations: SF team_members with a zenbooker_id that no longer
+    // appears in ZB's response. Mirrors the customer archival pattern above
+    // (line 701-741). Only run if pagination completed without wholesale
+    // errors — a partial ZB pull shouldn't nuke the SF roster. Also guards
+    // owner / admin roles because those rows may have a stray zenbooker_id
+    // from an early sync but should never be demoted by the ZB feed.
+    if (errors === 0 && zbTeam.length > 0) {
+      try {
+        const sfZbTeam = []
+        let from = 0
+        const pageSize = 1000
+        while (true) {
+          const { data } = await supabase.from('team_members')
+            .select('id, zenbooker_id, status, role')
+            .eq('user_id', userId)
+            .not('zenbooker_id', 'is', null)
+            .range(from, from + pageSize - 1)
+          if (!data?.length) break
+          sfZbTeam.push(...data)
+          if (data.length < pageSize) break
+          from += pageSize
+        }
+        const PROTECTED_ROLES = new Set(['account owner', 'owner', 'admin'])
+        const toDeactivate = sfZbTeam.filter(m =>
+          m.status !== 'inactive'
+          && !seenZbIds.has(String(m.zenbooker_id))
+          && !PROTECTED_ROLES.has(String(m.role || '').toLowerCase())
+        )
+        // Same 10% sanity threshold as the customer path.
+        const ratio = sfZbTeam.length > 0 ? toDeactivate.length / sfZbTeam.length : 0
+        if (ratio > 0.1) {
+          logger.warn(`[Zenbooker] Team deactivation-detection aborted: would deactivate ${toDeactivate.length}/${sfZbTeam.length} (${(ratio*100).toFixed(1)}%) — sanity threshold 10% exceeded. Skipping to avoid mass-deactivation.`)
+        } else if (toDeactivate.length > 0) {
+          for (const m of toDeactivate) {
+            await supabase.from('team_members')
+              .update({ status: 'inactive', updated_at: new Date().toISOString() })
+              .eq('id', m.id)
+            deactivated++
+          }
+          logger.log(`[Zenbooker] Deactivated ${deactivated} team_members no longer present in ZB.`)
+        }
+      } catch (e) {
+        logger.error('[Zenbooker] Team deactivation-detection step failed:', e?.message || e)
+      }
+    }
+
+    return { total: zbTeam.length, created, skipped, errors, mappingsUpserted, deactivated }
   }
 
   async function syncCustomers(userId, apiKey) {
