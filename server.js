@@ -2935,7 +2935,11 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   // CORS handled by middleware
   
   try {
-    const { userId: queryUserId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId, recurring } = req.query;
+    const { userId: queryUserId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId, recurring, noCount } = req.query;
+    // Opt-in flag: skip the COUNT(*) round-trip when the caller doesn't
+    // need pagination totals (bulk fetches from the calendar / customers
+    // list). Halves query time on tenants with many jobs.
+    const skipCount = noCount === '1' || noCount === 'true';
     
     // Get userId from token (authenticated user)
     const tokenUserId = req.user.userId || req.user.id;
@@ -2977,7 +2981,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         services!left(name, price, duration),
         team_members!left(first_name, last_name, email),
         job_team_assignments!left(team_member_id, is_primary, assigned_by, team_members(id, first_name, last_name, email))
-      `, { count: 'exact' })
+      `, skipCount ? undefined : { count: 'exact' })
       .eq('user_id', userId);
     
     // 🔒 WORKER RESTRICTION: Workers can only see jobs assigned to them
@@ -8834,13 +8838,17 @@ async function reconcilePendingConversations(tenantId, provider, phoneE164, mapp
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { search, page = 1, limit = 20, sortBy = 'created_at', sortOrder = 'DESC', status } = req.query;
+    const { search, page = 1, limit = 20, sortBy = 'created_at', sortOrder = 'DESC', status, noCount } = req.query;
+    // Opt-in: skip the COUNT(*) round-trip when the caller doesn't need
+    // pagination totals. Halves query time for the customers-list bulk
+    // fetch and avoids a second COUNT(*) in the >=10000 branch below.
+    const skipCount = noCount === '1' || noCount === 'true';
 
 
     // Build Supabase query
     let query = supabase
       .from('customers')
-      .select('*', { count: 'exact' })
+      .select('*', skipCount ? undefined : { count: 'exact' })
       .eq('user_id', userId);
     
     // Add status filter - by default, exclude archived customers unless explicitly requested
