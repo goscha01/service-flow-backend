@@ -406,6 +406,72 @@ describe('booking-request handler', () => {
     expect(res._body.error).toBe('slot_taken');
   });
 
+  test('Phase 2C: body.service_address populates SF service_address_* columns on jobs insert', async () => {
+    const stub = makeStub({ jobs: [], customers: [] });
+    const handler = makeBookingRequestHandler({
+      supabase: stub, logger: SILENT,
+      setCustomerAcquisitionIfMissing: SET_ACQUISITION_NOOP,
+    });
+    const res = mockRes();
+    await handler({
+      user: { userId: 2 },
+      body: mkBody({
+        territory: 'Jacksonville',
+        service_address: {
+          street: '123 Main St',
+          city: 'Jacksonville', state: 'FL', zip: '32224',
+        },
+      }),
+    }, res);
+    expect(res._status).toBe(201);
+    const jobInsert = stub._inserts.find(i => i.table === 'jobs');
+    expect(jobInsert).toBeTruthy();
+    expect(jobInsert.row.territory).toBe('Jacksonville');
+    expect(jobInsert.row.service_address_street).toBe('123 Main St');
+    expect(jobInsert.row.service_address_city).toBe('Jacksonville');
+    expect(jobInsert.row.service_address_state).toBe('FL');
+    expect(jobInsert.row.service_address_zip).toBe('32224');
+  });
+
+  test('Phase 2C: body.customer.address is a fallback source for service address', async () => {
+    const stub = makeStub({ jobs: [], customers: [] });
+    const handler = makeBookingRequestHandler({
+      supabase: stub, logger: SILENT,
+      setCustomerAcquisitionIfMissing: SET_ACQUISITION_NOOP,
+    });
+    const res = mockRes();
+    await handler({
+      user: { userId: 2 },
+      body: mkBody({
+        customer: {
+          first_name: 'Jane', last_name: 'Doe',
+          phone: '+15125551111', email: 'jane@example.com',
+          address: { line1: '456 Elm St', city: 'Tampa', state: 'FL', postal_code: '33602' },
+        },
+      }),
+    }, res);
+    expect(res._status).toBe(201);
+    const jobInsert = stub._inserts.find(i => i.table === 'jobs');
+    expect(jobInsert.row.service_address_street).toBe('456 Elm St');
+    expect(jobInsert.row.service_address_city).toBe('Tampa');
+    expect(jobInsert.row.service_address_zip).toBe('33602');
+  });
+
+  test('Phase 2C: absent address still succeeds — jobs row has null address, downstream producer defers', async () => {
+    const stub = makeStub({ jobs: [], customers: [] });
+    const handler = makeBookingRequestHandler({
+      supabase: stub, logger: SILENT,
+      setCustomerAcquisitionIfMissing: SET_ACQUISITION_NOOP,
+    });
+    const res = mockRes();
+    await handler({ user: { userId: 2 }, body: mkBody() }, res);
+    expect(res._status).toBe(201);
+    const jobInsert = stub._inserts.find(i => i.table === 'jobs');
+    expect(jobInsert.row.territory).toBeNull();
+    expect(jobInsert.row.service_address_street).toBeNull();
+    expect(jobInsert.row.service_address_city).toBeNull();
+  });
+
   test('idempotent replay returns prior response', async () => {
     const stub = makeStub({
       priorAttempt: {
