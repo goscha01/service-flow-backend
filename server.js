@@ -25381,6 +25381,22 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
       const dStart = toMinutes(dayHrs.start);
       const dEnd = toMinutes(dayHrs.end);
       if (dEnd > dStart) dayHoursTotal = (dEnd - dStart) / 60;
+    } else if (typeof dayHrs.hours === 'string' && dayHrs.hours.trim()) {
+      // Legacy display-string format: "9:00 AM - 6:00 PM". Some editors (see
+      // team-member-details*.jsx defaults) persist only this and drop start/end,
+      // which would otherwise return 0h → missing salary rows (Kate Gurina bug,
+      // 2026-08-15). Mirrors the Format 2 branch in isWorkerAvailableAtTime.
+      const m = dayHrs.hours.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+      if (m) {
+        let sh = parseInt(m[1], 10), eh = parseInt(m[4], 10);
+        if (m[3] && m[3].toUpperCase() === 'PM' && sh !== 12) sh += 12;
+        if (m[3] && m[3].toUpperCase() === 'AM' && sh === 12) sh = 0;
+        if (m[6] && m[6].toUpperCase() === 'PM' && eh !== 12) eh += 12;
+        if (m[6] && m[6].toUpperCase() === 'AM' && eh === 12) eh = 0;
+        const dStart = sh * 60 + parseInt(m[2], 10);
+        const dEnd = eh * 60 + parseInt(m[5], 10);
+        if (dEnd > dStart) dayHoursTotal = (dEnd - dStart) / 60;
+      }
     } else if (Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
       dayHrs.timeSlots.forEach(ts => {
         const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
