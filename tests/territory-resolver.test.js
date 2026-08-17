@@ -1,11 +1,12 @@
 /**
  * Territory resolver — unit tests.
  *
- * Covers the 4-tier resolution:
+ * Covers the tier resolution:
  *   - explicit value wins (override-safe)
- *   - tier 1: customer's prior job territory (with warning)
- *   - tier 2a: exact city-to-territory-name match (no warning)
- *   - tier 2b: city-to-territory-location-prefix match (with warning)
+ *   - tier 1: ZIP exact match against territories.zip_codes (no warning)
+ *   - tier 2: customer's prior job territory (with warning)
+ *   - tier 3a: exact city-to-territory-name match (no warning)
+ *   - tier 3b: city-to-territory-location-prefix match (with warning)
  *   - no match: returns null + explanatory warning
  *   - ambiguous: returns null + warning
  *   - NEVER throws on Supabase error
@@ -13,7 +14,14 @@
 
 const { resolveTerritory, VALID_CONFIDENCES } = require('../lib/territory-resolver');
 
-function makeSupabase({ priorJobs = null, priorJobsError = null, territories = null, territoriesError = null } = {}) {
+function makeSupabase({
+  priorJobs = null,
+  priorJobsError = null,
+  territories = null,
+  territoriesError = null,
+  zipTerritories = null,
+  zipTerritoriesError = null,
+} = {}) {
   return {
     from: jest.fn((tbl) => {
       if (tbl === 'jobs') {
@@ -36,11 +44,21 @@ function makeSupabase({ priorJobs = null, priorJobsError = null, territories = n
         };
       }
       if (tbl === 'territories') {
-        // Chain: .from('territories').select(...).eq('user_id',...).eq('status','active')
+        // Two chains land here:
+        //   Tier 1 (zip):  .select().eq(user_id).eq(status).contains('zip_codes', [zip])
+        //   Tier 3 (city): .select().eq(user_id).eq(status)  ← awaited directly
+        // We model .eq('status','active') as a promise that ALSO exposes
+        // a .contains() method so both paths resolve to their own data.
+        const cityResult = { data: territories, error: territoriesError };
+        const zipResult = { data: zipTerritories, error: zipTerritoriesError };
         return {
           select: jest.fn(() => ({
             eq: jest.fn(() => ({
-              eq: jest.fn(async () => ({ data: territories, error: territoriesError })),
+              eq: jest.fn(() => {
+                const p = Promise.resolve(cityResult);
+                p.contains = jest.fn(async () => zipResult);
+                return p;
+              }),
             })),
           })),
         };
@@ -72,7 +90,95 @@ describe('resolveTerritory — Tier 0 (explicit)', () => {
   });
 });
 
-describe('resolveTerritory — Tier 1 (prior-job inheritance)', () => {
+describe('resolveTerritory — Tier 1 (ZIP exact match)', () => {
+  test('zip in single active territory → assigned, no warning', async () => {
+    const supabase = makeSupabase({
+      zipTerritories: [{ id: 345, name: 'Tampa' }],
+    });
+    const r = await resolveTerritory(supabase, {
+      user_id: 2,
+      customer_id: 99,
+      service_address_zip: '33602',
+      service_address_city: 'Ignored',
+    });
+    expect(r.territory).toBe('Tampa');
+    expect(r.confidence).toBe('zip_match');
+    expect(r.warning).toBeNull();
+    expect(r.source).toBe('zip_exact_match');
+  });
+
+  test('zip matches multiple territories → ambiguous', async () => {
+    const supabase = makeSupabase({
+      zipTerritories: [
+        { id: 345, name: 'Tampa' },
+        { id: 999, name: 'Tampa Overflow' },
+      ],
+    });
+    const r = await resolveTerritory(supabase, { user_id: 2, service_address_zip: '33602' });
+    expect(r.territory).toBeNull();
+    expect(r.confidence).toBe('ambiguous');
+    expect(r.warning).toMatch(/Multiple territories claim ZIP 33602/);
+    expect(r.source).toBe('ambiguous_zip');
+  });
+
+  test('zip does not match → falls through to city tier', async () => {
+    const supabase = makeSupabase({
+      zipTerritories: [],
+      priorJobs: [],
+      territories: [{ id: 345, name: 'Tampa', location: 'Tampa, FL, USA' }],
+    });
+    const r = await resolveTerritory(supabase, {
+      user_id: 2,
+      customer_id: 99,
+      service_address_zip: '99999',
+      service_address_city: 'Tampa',
+    });
+    expect(r.confidence).toBe('exact_name');
+    expect(r.territory).toBe('Tampa');
+  });
+
+  test('zip match beats prior-job inheritance', async () => {
+    const supabase = makeSupabase({
+      zipTerritories: [{ id: 343, name: 'Miami' }],
+      priorJobs: [{ id: 142190, territory: 'Tampa' }],
+    });
+    const r = await resolveTerritory(supabase, {
+      user_id: 2,
+      customer_id: 23468,
+      service_address_zip: '33101',
+    });
+    expect(r.territory).toBe('Miami');
+    expect(r.confidence).toBe('zip_match');
+  });
+
+  test('explicit still wins over zip match', async () => {
+    const supabase = makeSupabase({
+      zipTerritories: [{ id: 345, name: 'Tampa' }],
+    });
+    const r = await resolveTerritory(supabase, {
+      user_id: 2,
+      currentTerritory: 'Miami',
+      service_address_zip: '33602',
+    });
+    expect(r.territory).toBe('Miami');
+    expect(r.confidence).toBe('explicit');
+  });
+
+  test('whitespace zip ignored', async () => {
+    const supabase = makeSupabase({
+      priorJobs: [],
+      territories: [{ id: 345, name: 'Tampa', location: 'Tampa, FL, USA' }],
+    });
+    const r = await resolveTerritory(supabase, {
+      user_id: 2,
+      service_address_zip: '   ',
+      service_address_city: 'Tampa',
+    });
+    expect(r.confidence).toBe('exact_name');
+  });
+});
+
+describe('resolveTerritory — Tier 2 (prior-job inheritance)', () => {
   test('customer with prior non-empty territory → inherits + warning', async () => {
     const supabase = makeSupabase({ priorJobs: [{ id: 142190, territory: 'Tampa' }] });
     const r = await resolveTerritory(supabase, { user_id: 2, customer_id: 23468, service_address_city: 'Winter Haven' });
@@ -96,7 +202,7 @@ describe('resolveTerritory — Tier 1 (prior-job inheritance)', () => {
   });
 });
 
-describe('resolveTerritory — Tier 2a (exact city name)', () => {
+describe('resolveTerritory — Tier 3a (exact city name)', () => {
   test('city matches territory.name (case-insensitive) → no warning', async () => {
     const supabase = makeSupabase({
       priorJobs: [],
@@ -127,7 +233,7 @@ describe('resolveTerritory — Tier 2a (exact city name)', () => {
   });
 });
 
-describe('resolveTerritory — Tier 2b (location-prefix match)', () => {
+describe('resolveTerritory — Tier 3b (location-prefix match)', () => {
   test('city as location prefix → fills with warning', async () => {
     const supabase = makeSupabase({
       priorJobs: [],
@@ -212,6 +318,7 @@ describe('resolveTerritory — never-throws', () => {
 describe('VALID_CONFIDENCES exposure', () => {
   test('all returned confidences are in VALID_CONFIDENCES', () => {
     expect(VALID_CONFIDENCES).toContain('explicit');
+    expect(VALID_CONFIDENCES).toContain('zip_match');
     expect(VALID_CONFIDENCES).toContain('inherited_from_prior_job');
     expect(VALID_CONFIDENCES).toContain('exact_name');
     expect(VALID_CONFIDENCES).toContain('location_prefix');
