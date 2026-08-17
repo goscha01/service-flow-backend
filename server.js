@@ -49,7 +49,12 @@ const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 const { startReconcileCron: startZbFutureReconcileCron } = require('./workers/zb-future-reconcile-cron');
-const { startAvailabilityReconcileCron: startZbAvailabilityReconcileCron } = require('./workers/zb-availability-reconcile-cron');
+const {
+  startAvailabilityReconcileCron: startZbAvailabilityReconcileCron,
+  runReconcileTick: runZbAvailabilityReconcileTick,
+  zbFetch: zbAvailabilityFetch,
+} = require('./workers/zb-availability-reconcile-cron');
+const { reconcileTenantAvailability: reconcileTenantAvailabilityFn } = require('./lib/zenbooker-availability-reconcile');
 const { updateJobStatus: jobStatusServiceUpdate } = require('./services/job-status-service');
 const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
 const { startDrainer: startLbOrchestrationWebhookDrainer } = require('./workers/lb-orchestration-webhook-drainer');
@@ -27181,6 +27186,75 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
     console.error('Update team member availability error:', error);
     res.status(500).json({ error: 'Failed to update team member availability' });
   }
+});
+
+// ==================== ZB Availability Sync (on-demand) ====================
+//
+// The nightly cron (workers/zb-availability-reconcile-cron.js) is env-gated
+// and currently disabled in prod. Operators use this endpoint to force a
+// fresh pull from Zenbooker /timeslots into team_members.availability
+// customAvailability envelope entries. Same reconcile logic as the cron —
+// reuses reconcileTenantAvailability() with dryRun=false.
+//
+// Runs in the background (setImmediate) — for tenants with many cleaners
+// the loop paces requests to ZB (250ms/member × lookahead) and can exceed
+// the request timeout. Client polls /progress until status === 'done'.
+
+const teamAvailabilitySyncProgress = {}; // userId → { status, startedAt, summary, error }
+
+app.post('/api/team-availability/sync', authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  const key = String(userId);
+  if (teamAvailabilitySyncProgress[key]?.status === 'running') {
+    return res.status(409).json({ error: 'sync already running', progress: teamAvailabilitySyncProgress[key] });
+  }
+
+  const { data: user, error: userErr } = await supabase
+    .from('users')
+    .select('zenbooker_api_key, zenbooker_status')
+    .eq('id', userId)
+    .maybeSingle();
+  if (userErr) {
+    return res.status(500).json({ error: 'user query failed', detail: userErr.message });
+  }
+  if (!user?.zenbooker_api_key || user.zenbooker_status !== 'connected') {
+    return res.status(400).json({ error: 'Zenbooker not connected for this account' });
+  }
+
+  const progress = { status: 'running', startedAt: Date.now() };
+  teamAvailabilitySyncProgress[key] = progress;
+
+  setImmediate(async () => {
+    try {
+      const { summary, failed } = await reconcileTenantAvailabilityFn({
+        supabase,
+        userId,
+        apiKey: user.zenbooker_api_key,
+        dryRun: false,
+        zbFetchFn: zbAvailabilityFetch,
+        logger,
+      });
+      if (failed) {
+        progress.status = 'error';
+        progress.error = 'reconcile failed — see server logs';
+      } else {
+        progress.status = 'done';
+        progress.summary = summary;
+        progress.finishedAt = Date.now();
+      }
+    } catch (e) {
+      progress.status = 'error';
+      progress.error = e.message || String(e);
+      logger.error('[TeamAvailabilitySync] userId=' + userId + ' failed: ' + (e.message || e));
+    }
+  });
+
+  res.status(202).json({ started: true, progress });
+});
+
+app.get('/api/team-availability/sync/progress', authenticateToken, (req, res) => {
+  const key = String(req.user.userId);
+  res.json(teamAvailabilitySyncProgress[key] || { status: 'idle' });
 });
 
 // ==================== Staff Location Tracking Endpoints ====================
