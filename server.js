@@ -51,10 +51,8 @@ const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-
 const { startReconcileCron: startZbFutureReconcileCron } = require('./workers/zb-future-reconcile-cron');
 const {
   startAvailabilityReconcileCron: startZbAvailabilityReconcileCron,
-  runReconcileTick: runZbAvailabilityReconcileTick,
-  zbFetch: zbAvailabilityFetch,
 } = require('./workers/zb-availability-reconcile-cron');
-const { reconcileTenantAvailability: reconcileTenantAvailabilityFn } = require('./lib/zenbooker-availability-reconcile');
+const { syncAvailabilityFromZenbooker: syncAvailabilityOnlyFromZb } = require('./lib/zenbooker-availability-only-sync');
 const { updateJobStatus: jobStatusServiceUpdate } = require('./services/job-status-service');
 const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
 const { startDrainer: startLbOrchestrationWebhookDrainer } = require('./workers/lb-orchestration-webhook-drainer');
@@ -5425,6 +5423,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         user_id: userId,
         customer_id: customerId,
         service_address_city: serviceAddress && serviceAddress.city,
+        service_address_zip: serviceAddress && serviceAddress.zipCode,
         currentTerritory: territory,
         logger,
       });
@@ -20873,106 +20872,79 @@ app.delete('/api/territories/:id', authenticateToken, async (req, res) => {
 });
 
 // Territory detection based on customer location
-app.post('/api/territories/detect', async (req, res) => {
+// Territory preview / detection.
+//
+// Runs `resolveTerritory` (see lib/territory-resolver.js) against a
+// candidate address so the frontend can prefill the territory chip on
+// customer- or job-create BEFORE the row is written. When the resolver
+// returns confidence 'ambiguous' or 'no_match', we also include the
+// active-territory list as `alternatives` so the UI can open a manual
+// picker.
+async function handleTerritoryPreview(req, res) {
   try {
-    const { userId, customerAddress, customerZipCode } = req.body;
-    
-    if (!userId || (!customerAddress && !customerZipCode)) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    const b = req.body || {};
+    const userId = b.userId != null ? b.userId : b.user_id;
+    const zipCode = b.zipCode != null ? b.zipCode : (b.customerZipCode != null ? b.customerZipCode : b.zip);
+    const city = b.city != null ? b.city : b.customerCity;
+    const customerId = b.customerId != null ? b.customerId : b.customer_id;
+
+    if (!userId || (!zipCode && !city)) {
+      return res.status(400).json({ error: 'userId and one of {zipCode, city} are required' });
     }
-    
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get all active territories for the user
-      const [territories] = await connection.query(`
-        SELECT * FROM territories 
-        WHERE user_id = ? AND status = 'active'
-      `, [userId]);
-      
-      let matchedTerritory = null;
-      
-      for (const territory of territories) {
-        const territoryZipCodes = JSON.parse(territory.zip_codes || '[]');
-        const territoryRadius = territory.radius_miles || 25;
-        
-        // Check if customer ZIP code matches territory ZIP codes
-        if (customerZipCode && territoryZipCodes.includes(customerZipCode)) {
-          matchedTerritory = territory;
-          break;
-        }
-        
-        // Check if customer address is within territory radius
-        if (customerAddress && territoryRadius > 0 && process.env.GOOGLE_MAPS_API_KEY) {
-          try {
-            // Get coordinates for customer address
-            const customerGeocodeResponse = await axios.get(
-              `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(customerAddress)}&key=${process.env.GOOGLE_MAPS_API_KEY}`
-            )
 
-            if (customerGeocodeResponse.status !== 200) {
-              console.warn('Google Maps API request failed for customer address');
-              continue;
-            }
+    const { resolveTerritory } = require('./lib/territory-resolver');
+    const tr = await resolveTerritory(supabase, {
+      user_id: userId,
+      customer_id: customerId,
+      service_address_zip: zipCode,
+      service_address_city: city,
+    });
 
-            const customerGeocodeData = customerGeocodeResponse.data
-            
-            if (customerGeocodeData.results && customerGeocodeData.results.length > 0) {
-              const customerCoords = customerGeocodeData.results[0].geometry.location
-              
-              // Get coordinates for territory center (using location field)
-              const territoryGeocodeResponse = await axios.get(
-                `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(territory.location)}&key=${process.env.GOOGLE_MAPS_API_KEY}`
-              )
-
-              if (territoryGeocodeResponse.status !== 200) {
-                console.warn('Google Maps API request failed for territory location');
-                continue;
-              }
-
-              const territoryGeocodeData = territoryGeocodeResponse.data
-              
-              if (territoryGeocodeData.results && territoryGeocodeData.results.length > 0) {
-                const territoryCoords = territoryGeocodeData.results[0].geometry.location
-                
-                // Calculate distance between points
-                const distance = calculateDistance(
-                  customerCoords.lat, customerCoords.lng,
-                  territoryCoords.lat, territoryCoords.lng
-                )
-                
-                if (distance <= territoryRadius) {
-                  matchedTerritory = territory
-                  break
-                }
-              }
-            }
-          } catch (error) {
-            console.error('Error in geocoding:', error)
-            // Continue to next territory if geocoding fails
-          }
-        }
-      }
-      
-      if (matchedTerritory) {
-        matchedTerritory.zip_codes = JSON.parse(matchedTerritory.zip_codes || '[]');
-        matchedTerritory.business_hours = JSON.parse(matchedTerritory.business_hours || '{}');
-        matchedTerritory.team_members = JSON.parse(matchedTerritory.team_members || '[]');
-        matchedTerritory.services = JSON.parse(matchedTerritory.services || '[]');
-      }
-      
-      res.json({
-        territory: matchedTerritory,
-        available: !!matchedTerritory
-      });
-    } finally {
-      connection.release();
+    let territoryId = null;
+    let alternatives = [];
+    if (tr.territory) {
+      // Look up the id for the resolved name so the frontend can bind
+      // both `territory` (name) and `territoryId` (fk) without a second
+      // round-trip.
+      const { data: match } = await supabase
+        .from('territories')
+        .select('id, name, location')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .eq('name', tr.territory)
+        .limit(1);
+      if (match && match[0]) territoryId = match[0].id;
     }
+    if (tr.confidence === 'ambiguous' || tr.confidence === 'no_match') {
+      const { data: all } = await supabase
+        .from('territories')
+        .select('id, name, location, zip_codes')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .order('name');
+      alternatives = all || [];
+    }
+
+    return res.json({
+      territory: tr.territory,
+      territoryId,
+      confidence: tr.confidence,
+      warning: tr.warning,
+      source: tr.source,
+      alternatives,
+      available: !!tr.territory,
+    });
   } catch (error) {
-    console.error('Territory detection error:', error);
-    res.status(500).json({ error: 'Failed to detect territory' });
+    console.error('Territory preview error:', error);
+    return res.status(500).json({ error: 'Failed to preview territory' });
   }
-});
+}
+
+app.post('/api/territories/preview', handleTerritoryPreview);
+// Legacy alias — `/detect` predates `/preview` and previously ran a
+// broken MySQL query; kept as a thin forward so any lingering callers
+// (see api.js#territoriesAPI.detectTerritory) still get sensible data.
+app.post('/api/territories/detect', handleTerritoryPreview);
 
 // Get available team members for a territory - DISABLED (MySQL not configured)
 // app.get('/api/territories/:id/team-members', async (req, res) => {
@@ -27190,15 +27162,19 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
 
 // ==================== ZB Availability Sync (on-demand) ====================
 //
-// The nightly cron (workers/zb-availability-reconcile-cron.js) is env-gated
-// and currently disabled in prod. Operators use this endpoint to force a
-// fresh pull from Zenbooker /timeslots into team_members.availability
-// customAvailability envelope entries. Same reconcile logic as the cron —
-// reuses reconcileTenantAvailability() with dryRun=false.
+// Pulls Zenbooker /team_members (recurring_hours + date_overrides) for the
+// caller's tenant and rewrites team_members.availability via
+// buildAvailabilityFromZb. Same mapping the full ZB sync uses, isolated to
+// availability so it's cheap enough for an on-demand button.
 //
-// Runs in the background (setImmediate) — for tenants with many cleaners
-// the loop paces requests to ZB (250ms/member × lookahead) and can exceed
-// the request timeout. Client polls /progress until status === 'done'.
+// Off-days in ZB (date_override with hours: []) are recorded as
+// customAvailability { available: false, source: 'zenbooker' } — the older
+// /timeslots reconciler could not represent those and silently dropped
+// them, which is why "Alina has 18-19 off in ZB but SF shows available"
+// slipped through the earlier sync.
+//
+// Runs in the background (setImmediate); client polls /progress until
+// status === 'done'.
 
 const teamAvailabilitySyncProgress = {}; // userId → { status, startedAt, summary, error }
 
@@ -27226,17 +27202,15 @@ app.post('/api/team-availability/sync', authenticateToken, async (req, res) => {
 
   setImmediate(async () => {
     try {
-      const { summary, failed } = await reconcileTenantAvailabilityFn({
+      const { summary, failed, reason } = await syncAvailabilityOnlyFromZb({
         supabase,
         userId,
         apiKey: user.zenbooker_api_key,
-        dryRun: false,
-        zbFetchFn: zbAvailabilityFetch,
         logger,
       });
       if (failed) {
         progress.status = 'error';
-        progress.error = 'reconcile failed — see server logs';
+        progress.error = reason || 'sync failed — see server logs';
       } else {
         progress.status = 'done';
         progress.summary = summary;
