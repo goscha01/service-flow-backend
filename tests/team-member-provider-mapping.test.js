@@ -381,7 +381,11 @@ describe('zenbooker-sync.js integration', () => {
     expect(fnStart).toBeGreaterThan(-1);
     // Slice through end of function — find the next `async function` at the
     // same indentation level, or end of file.
-    const fnSlice = ZB_SYNC_JS.slice(fnStart, fnStart + 6000);
+    // Window widened from 6000 → 9000 after address-sync + one-shot
+    // diagnostic log were added inside syncTeamMembers. Both helper
+    // calls (skip-existing gap-fill + post-insert mirror) still live
+    // in the function body; they just no longer fit in 6000 chars.
+    const fnSlice = ZB_SYNC_JS.slice(fnStart, fnStart + 9000);
     const matches = fnSlice.match(/upsertTeamMemberProviderMappingFromZbSync/g);
     expect(matches).not.toBeNull();
     expect(matches.length).toBeGreaterThanOrEqual(2);

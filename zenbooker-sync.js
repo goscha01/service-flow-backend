@@ -681,6 +681,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       statusCounts[s] = (statusCounts[s] || 0) + 1
     }
     logger.log(`[Zenbooker] /team_members raw=${zbTeamRaw.length} user_status counts=${JSON.stringify(statusCounts)}`)
+    // One-shot diagnostic: dump the first ZB team-member payload shape so
+    // we can see which fields carry the home address. Remove after the
+    // address-sync mapping is confirmed working.
+    if (zbTeamRaw[0]) {
+      const sample = zbTeamRaw[0]
+      logger.log(`[Zenbooker][DBG] team_member sample keys=[${Object.keys(sample).join(',')}]`)
+      logger.log(`[Zenbooker][DBG] team_member sample payload: ${JSON.stringify(sample).slice(0, 800)}`)
+    }
     const zbTeam = zbTeamRaw.filter(zb =>
       !INACTIVE_ZB_STATUSES.has(String(zb?.user_status ?? '').toLowerCase())
     )
