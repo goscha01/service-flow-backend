@@ -1262,6 +1262,24 @@ const sanitizeInput = (input) => {
   return validator.escape(input.trim());
 };
 
+// Normalize a client-provided ZIP-exclusion list to a jsonb-safe array
+// of 5-digit strings. Drops empties, ZIP+4 suffixes are collapsed to
+// the 5-digit prefix, dedupes, ignores garbage. Returns []; callers
+// can use `?? undefined` if they want to skip the column on update.
+const sanitizeZipExclusions = (input) => {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of input) {
+    const z = String(raw || '').trim().replace(/-.*$/, '');
+    if (!/^\d{5}$/.test(z)) continue;
+    if (seen.has(z)) continue;
+    seen.add(z);
+    out.push(z);
+  }
+  return out;
+};
+
 // Calculate distance between two points using Haversine formula
 const calculateDistance = (lat1, lon1, lat2, lon2) => {
   const R = 3959 // Earth's radius in miles
@@ -4322,9 +4340,21 @@ async function checkSchedulingRules(serviceId, dateStr) {
   }
 }
 
+// Extract a 5-digit ZIP from a free-form US address string. Returns
+// null if none found. Used by the availability engine so callers can
+// keep passing `customerAddress` and still get ZIP-exclusion
+// enforcement without a schema change to their call.
+function extractZipFromAddress(addr) {
+  if (!addr) return null;
+  const m = String(addr).match(/\b(\d{5})(?:-\d{4})?\b/);
+  return m ? m[1] : null;
+}
+
 // Main shared slot generation function
 // customerAddress (optional, Phase 3.1): customer's address for location-based driving time
-async function generateAvailableSlots({ userId, dateStr, durationMinutes, serviceId, workerId, customerAddress }) {
+// customerZip (optional): if omitted, extracted from customerAddress. Members whose
+//   `zip_exclusions` contains this ZIP are hard-blocked from the slot output.
+async function generateAvailableSlots({ userId, dateStr, durationMinutes, serviceId, workerId, customerAddress, customerZip }) {
   const requestedDate = new Date(dateStr + 'T12:00:00');
   if (isNaN(requestedDate.getTime())) {
     return { error: 'Invalid date format', slots: [] };
@@ -4380,10 +4410,10 @@ async function generateAvailableSlots({ userId, dateStr, durationMinutes, servic
     ? await getPerJobDrivingTimes(existingJobs || [], customerAddress, drivingTimeMinutes)
     : null;
 
-  // 5) Fetch team members
+  // 5) Fetch team members (include zip_exclusions for the ZIP-exclusion filter below)
   let tmQuery = supabase
     .from('team_members')
-    .select('id, first_name, last_name, availability, skills')
+    .select('id, first_name, last_name, availability, skills, zip_exclusions')
     .eq('user_id', userId)
     .eq('status', 'active');
   if (workerId) tmQuery = tmQuery.eq('id', workerId);
@@ -4401,6 +4431,18 @@ async function generateAvailableSlots({ userId, dateStr, durationMinutes, servic
       const workerSkills = w.skills || [];
       const skillsArr = Array.isArray(workerSkills) ? workerSkills : [];
       return config.skillsRequired.every(s => skillsArr.includes(s));
+    });
+  }
+
+  // 6b) ZIP-exclusion hard block. If we know the destination ZIP (from
+  // an explicit arg or extractable from customerAddress), drop any
+  // member whose zip_exclusions contains it. Members with empty/null
+  // exclusion lists pass through unchanged.
+  const resolvedZip = customerZip || extractZipFromAddress(customerAddress);
+  if (resolvedZip) {
+    eligibleWorkers = eligibleWorkers.filter(w => {
+      const excl = Array.isArray(w.zip_exclusions) ? w.zip_exclusions : [];
+      return !excl.map(String).includes(String(resolvedZip));
     });
   }
 
@@ -4583,7 +4625,7 @@ async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, 
 app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { date, duration = 120, workerId, serviceId, customerAddress } = req.query;
+    const { date, duration = 120, workerId, serviceId, customerAddress, customerZip } = req.query;
 
     if (!date) {
       return res.status(400).json({ error: 'Date parameter is required' });
@@ -4596,7 +4638,8 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
       durationMinutes,
       serviceId: serviceId || null,
       workerId: workerId || null,
-      customerAddress: customerAddress || null
+      customerAddress: customerAddress || null,
+      customerZip: customerZip || null
     });
 
     if (result.error) {
@@ -5436,6 +5479,35 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       logger.log(`[Territory resolver] sf_job_create user_id=${userId} customer_id=${customerId} confidence=${tr.confidence} source=${tr.source} territory=${tr.territory == null ? 'null' : tr.territory}`);
     } catch (terrErr) {
       logger.warn(`[Territory resolver] failed (non-blocking): ${terrErr && terrErr.message}`);
+    }
+
+    // ZIP-exclusion soft warning. Manual assignment is allowed; we
+    // surface a bookingWarnings entry so the operator sees "This
+    // cleaner is normally excluded from ZIP X" and can decide. The
+    // availability engine already hard-blocks these members from
+    // auto-suggestions — this branch fires when the operator picks
+    // a specific member manually.
+    try {
+      const zip = serviceAddress && serviceAddress.zipCode ? String(serviceAddress.zipCode).trim() : null;
+      const assignedIds = [];
+      if (teamMemberId != null) assignedIds.push(teamMemberId);
+      const bodyMulti = Array.isArray(req.body.teamMemberIds) ? req.body.teamMemberIds : [];
+      for (const id of bodyMulti) if (id != null && !assignedIds.includes(id)) assignedIds.push(id);
+      if (zip && assignedIds.length > 0) {
+        const { data: exclChecks } = await supabase
+          .from('team_members')
+          .select('id, first_name, last_name, zip_exclusions')
+          .in('id', assignedIds);
+        for (const m of exclChecks || []) {
+          const excl = Array.isArray(m.zip_exclusions) ? m.zip_exclusions.map(String) : [];
+          if (excl.includes(zip)) {
+            const name = `${m.first_name || ''} ${m.last_name || ''}`.trim() || `#${m.id}`;
+            bookingWarnings.push(`ZIP ${zip} is on ${name}'s excluded list — they normally aren't routed to this ZIP. Assignment allowed; verify with them if needed.`);
+          }
+        }
+      }
+    } catch (exclErr) {
+      logger.warn(`[ZIP-exclusion warn] failed (non-blocking): ${exclErr && exclErr.message}`);
     }
 
     // Process modifiers and intake questions to calculate final price and duration
@@ -18498,7 +18570,7 @@ app.get('/api/public/services', async (req, res) => {
 
 app.get('/api/public/availability', async (req, res) => {
   try {
-    const { userId = 1, date, serviceId, duration = 120, customerAddress } = req.query;
+    const { userId = 1, date, serviceId, duration = 120, customerAddress, customerZip } = req.query;
 
     if (!date) {
       return res.status(400).json({ error: 'Date is required (YYYY-MM-DD)' });
@@ -18511,7 +18583,8 @@ app.get('/api/public/availability', async (req, res) => {
       durationMinutes,
       serviceId: serviceId || null,
       workerId: null,
-      customerAddress: customerAddress || null
+      customerAddress: customerAddress || null,
+      customerZip: customerZip || null
     });
 
     if (result.error) {
@@ -23467,9 +23540,10 @@ app.post('/api/team-members', async (req, res) => {
       state,
       zipCode,
       territories,
-      permissions
+      permissions,
+      zipExclusions
     } = req.body;
-    
+
     // Validate required fields - firstName and lastName are optional
     if (!userId || !email || !username || !password) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -23635,6 +23709,7 @@ app.post('/api/team-members', async (req, res) => {
         zip_code: zipCode || null,
         territories,
         permissions,
+        zip_exclusions: sanitizeZipExclusions(zipExclusions),
         ...(await checkColorColumn() ? { color: randomColor } : {}),
         status: 'invited',
         invitation_token: invitationToken,
@@ -23732,7 +23807,9 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       hourly_rate, // Support snake_case from frontend
       commission_percentage, // Support snake_case from frontend
       salaryStartDate,
-      salary_start_date
+      salary_start_date,
+      zipExclusions,
+      zip_exclusions
     } = req.body;
     
     // Normalize field names (support both camelCase and snake_case)
@@ -23999,7 +24076,14 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
     if (territories !== undefined) {
       dataToSave.territories = typeof territories === 'string' ? territories : JSON.stringify(territories);
     }
-    
+
+    // Accept zipExclusions (camelCase) or zip_exclusions (snake_case).
+    // undefined = don't touch; [] explicitly clears the exclusion list.
+    const zipExclusionsInput = zipExclusions !== undefined ? zipExclusions : zip_exclusions;
+    if (zipExclusionsInput !== undefined) {
+      dataToSave.zip_exclusions = sanitizeZipExclusions(zipExclusionsInput);
+    }
+
     if (permissions !== undefined) {
       // Ensure permissions is stored as JSON string if it's an object
       if (typeof permissions === 'object' && permissions !== null) {
@@ -28734,7 +28818,7 @@ app.get('/api/public/services/:userId', async (req, res) => {
 app.get('/api/public/availability/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { date, serviceId, duration = 120, customerAddress } = req.query;
+    const { date, serviceId, duration = 120, customerAddress, customerZip } = req.query;
 
     if (!date) {
       return res.status(400).json({ error: 'Date is required (YYYY-MM-DD)' });
@@ -28747,7 +28831,8 @@ app.get('/api/public/availability/:userId', async (req, res) => {
       durationMinutes,
       serviceId: serviceId || null,
       workerId: null,
-      customerAddress: customerAddress || null
+      customerAddress: customerAddress || null,
+      customerZip: customerZip || null
     });
 
     if (result.error) {
