@@ -49,6 +49,7 @@ const {
   makeAvailabilityHandler,
   makeBusyHandler,
   makeLocationsHandler,
+  makeTeamFreeWindowsHandler,
   makeBookingRequestHandler,
   makeBookingCancelHandler,
   makeHandoffHandler,
@@ -1693,6 +1694,9 @@ module.exports = (supabase, logger) => {
     supabase, logger, resolveLocationForOrchestrationScope,
   })
   const orchLocationsHandler = makeLocationsHandler({ supabase, logger })
+  const orchTeamFreeWindowsHandler = makeTeamFreeWindowsHandler({
+    supabase, logger, resolveLocationForOrchestrationScope,
+  })
   const orchBookingRequestHandler = makeBookingRequestHandler({
     supabase, logger, setCustomerAcquisitionIfMissing: _setCustomerAcquisitionIfMissing2B,
   })
@@ -1713,6 +1717,8 @@ module.exports = (supabase, logger) => {
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBusyHandler)
   router.get('/orchestration/locations',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchLocationsHandler)
+  router.get('/orchestration/team-free-windows',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchTeamFreeWindowsHandler)
   router.post('/orchestration/booking-request',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingRequestHandler)
   router.post('/orchestration/booking-cancel',
