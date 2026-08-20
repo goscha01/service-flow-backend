@@ -209,6 +209,51 @@ describe('team-free-windows handler — scope', () => {
     expect(res._body.team).toEqual([]);
     expect(res._body.scope.resolution).toBe('unknown_business');
   });
+
+  // Regression pin for the 2026-08-20 cross-territory-double-booking fix.
+  // A cleaner assigned to two territories has ONE physical calendar — a
+  // job in territory B makes them unavailable regardless of which
+  // territory a caller queries about. Prior behavior filtered `jobs` by
+  // `territory_id = scopedLocationId`, so a query for territory A did
+  // not subtract the cleaner's territory-B jobs and returned that slot
+  // as "free" — letting LB double-book them.
+  //
+  // New behavior: scope filters WHICH cleaners are returned (must be
+  // assigned to the queried territory), but ALL of that cleaner's
+  // jobs are subtracted, so free_windows reflect true availability.
+  test('scoped call still subtracts cross-territory jobs from a multi-territory cleaner', async () => {
+    const teamMembers = [{
+      id: 100, first_name: 'CrossTerr', last_name: 'Cleaner',
+      user_id: 2, is_service_provider: true, is_active: true, status: 'active', role: 'cleaner',
+      territories: [341, 345], // Jacksonville + Tampa
+      availability: WEEKLY_9_18,
+    }];
+    const jobs = [
+      // Job in Tampa (345) — must still subtract when caller queries JAX (341)
+      { id: 1, user_id: 2, status: 'scheduled', team_member_id: 100,
+        territory_id: 345,
+        scheduled_date: '2026-08-19 14:00:00', duration: 120, end_time: null,
+        job_team_assignments: [{ team_member_id: 100 }] },
+    ];
+    const h = makeTeamFreeWindowsHandler({ supabase: makeStub({ teamMembers, jobs }), logger: SILENT });
+    const res = mockRes();
+    await h({
+      user: { userId: 2 },
+      query: { from: '2026-08-19T00:00:00', to: '2026-08-19T23:59:00', sf_location_id: '341' },
+    }, res);
+    expect(res._status).toBe(200);
+    expect(res._body.scope).toEqual({ resolution: 'explicit', location_id: 341 });
+    // Cleaner is in the returned team (assigned to JAX).
+    expect(res._body.team.map(t => t.team_member_id)).toEqual([100]);
+    const day = res._body.team[0].days.find(d => d.date === '2026-08-19');
+    // Free windows MUST omit 14:00-16:00 (that Tampa job) — this is the
+    // real availability the AI booking path needs to trust.
+    expect(day.free_windows).toEqual([
+      { start: '09:00', end: '14:00' },
+      { start: '16:00', end: '18:00' },
+    ]);
+    expect(day.free_minutes).toBe(7 * 60); // 9h shift - 2h cross-territory job
+  });
 });
 
 describe('team-free-windows handler — audit', () => {
