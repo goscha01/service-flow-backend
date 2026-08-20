@@ -64,7 +64,7 @@ function hoursOf(blocks) {
   // team members
   const { data: tms, error: tmErr } = await supabase
     .from('team_members')
-    .select('id, first_name, last_name, email, is_active, status, availability')
+    .select('id, first_name, last_name, email, is_active, status, availability, is_service_provider, role')
     .eq('user_id', USER_ID);
   if (tmErr) throw tmErr;
 
@@ -133,8 +133,11 @@ function hoursOf(blocks) {
     for (const tmId of set) addBusy(tmId, dateKey, block);
   }
 
+  const MANAGER_ROLES = new Set(['account owner', 'owner', 'admin', 'manager']);
   const activeReal = tms.filter(t =>
     t.is_active && (t.status ?? 'active') === 'active' &&
+    t.is_service_provider === true &&
+    !MANAGER_ROLES.has(String(t.role || '').toLowerCase()) &&
     !/test/i.test(`${t.first_name || ''} ${t.last_name || ''}`)
   );
 

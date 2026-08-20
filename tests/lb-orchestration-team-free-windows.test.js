@@ -268,3 +268,70 @@ describe('team-free-windows handler — audit', () => {
     expect(audit[0].row.result).toBe('success');
   });
 });
+
+// end_time-is-a-lie regression — see 2026-08-20 divergence audit.
+// jobs.end_time stores the actual CLOCK-OUT timestamp (when the cleaner
+// marked the job completed), not the scheduled end. A prior version of
+// this handler used end_time when present, which produced 4–7h phantom
+// blocks per over-running job and under-reported per-cleaner free time
+// by 4–7h/week. Fixture below is Larisa Shumelda Wed 8/19 as read from
+// prod on the day of the fix. If the handler ever regresses to reading
+// end_time, this test catches it because the phantom 13:00–18:47 block
+// swallows the 14:30–15:00 gap.
+describe('team-free-windows handler — end_time is a completion timestamp, never trust it', () => {
+  test("Larisa 8/19 fixture: job 142544 (13:00 dur=90, end_time=18:47) treated as 13:00-14:30, not 13:00-18:47", async () => {
+    const teamMembers = [{
+      id: 2657, first_name: 'Larisa', last_name: 'Shumelda',
+      user_id: 2, is_service_provider: true, is_active: true, status: 'active', role: 'cleaner',
+      availability: WEEKLY_9_18,
+    }];
+    // Real fixture pulled from prod on 2026-08-20 — both jobs completed
+    // hours after scheduled end. Correct behavior: subtract only the
+    // scheduled windows (90m + 105m) from the 9-18 shift, yielding three
+    // free windows including 14:30-15:00 and 16:45-18:00.
+    const jobs = [
+      { id: 142544, user_id: 2, status: 'completed', team_member_id: 2657,
+        scheduled_date: '2026-08-19 13:00:00', duration: 90,
+        end_time: '2026-08-19T18:47:02.493', job_team_assignments: [] },
+      { id: 142621, user_id: 2, status: 'completed', team_member_id: 2657,
+        scheduled_date: '2026-08-19 15:00:00', duration: 105,
+        end_time: '2026-08-19T22:16:22.636', job_team_assignments: [] },
+    ];
+    const h = makeTeamFreeWindowsHandler({ supabase: makeStub({ teamMembers, jobs }), logger: SILENT });
+    const res = mockRes();
+    await h({ user: { userId: 2 }, query: { from: '2026-08-19T00:00:00', to: '2026-08-19T23:59:00' } }, res);
+    expect(res._status).toBe(200);
+    const day = res._body.team[0].days.find(d => d.date === '2026-08-19');
+    // 9h shift minus 90m minus 105m = 5.75h = 345m
+    expect(day.free_minutes).toBe(345);
+    expect(day.free_windows).toEqual([
+      { start: '09:00', end: '13:00' },  // pre-first-job
+      { start: '14:30', end: '15:00' },  // gap between scheduled ends of jobs
+      { start: '16:45', end: '18:00' },  // post-second-job
+    ]);
+    // If the handler regresses to reading end_time, the merged phantom
+    // block [13:00, 22:16] would swallow both middle windows and the
+    // day would collapse to only [09:00, 13:00] = 4h free.
+    expect(day.free_windows).not.toContainEqual({ start: '13:00', end: '13:00' });
+  });
+
+  test('date-only scheduled_date is still skipped (dead scheduled_time default)', async () => {
+    // Belt-and-suspenders for the pre-existing "no time part → skip"
+    // behavior at handler line ~602. Reasserted here because both fixes
+    // touch the same parse block and a future edit could accidentally
+    // reintroduce a scheduled_time fallback.
+    const teamMembers = [{
+      id: 1, first_name: 'A', user_id: 2, is_service_provider: true, is_active: true, status: 'active', role: 'cleaner',
+      availability: WEEKLY_9_18,
+    }];
+    const jobs = [
+      { id: 1, user_id: 2, status: 'scheduled', team_member_id: 1, scheduled_date: '2026-08-19', duration: 180, end_time: null, job_team_assignments: [] },
+    ];
+    const h = makeTeamFreeWindowsHandler({ supabase: makeStub({ teamMembers, jobs }), logger: SILENT });
+    const res = mockRes();
+    await h({ user: { userId: 2 }, query: { from: '2026-08-19T00:00:00', to: '2026-08-19T23:59:00' } }, res);
+    const day = res._body.team[0].days.find(d => d.date === '2026-08-19');
+    expect(day.free_minutes).toBe(9 * 60);
+    expect(day.free_windows).toEqual([{ start: '09:00', end: '18:00' }]);
+  });
+});
