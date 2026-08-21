@@ -776,7 +776,7 @@ module.exports = (supabase, logger) => {
   router.get('/settings', requireSfUserJwt, async (req, res) => {
     const { data, error } = await supabase
       .from('users')
-      .select('proofpix_show_recurring_jobs')
+      .select('proofpix_show_recurring_jobs, proofpix_new_customers_only')
       .eq('id', req.sfUserId)
       .single();
     if (error) {
@@ -785,6 +785,7 @@ module.exports = (supabase, logger) => {
     }
     return res.status(200).json({
       show_recurring_jobs: !!(data && data.proofpix_show_recurring_jobs),
+      new_customers_only: !!(data && data.proofpix_new_customers_only),
     });
   });
 
@@ -801,23 +802,47 @@ module.exports = (supabase, logger) => {
   // ═════════════════════════════════════════════════════════════════
   router.patch('/settings', requireSfUserJwt, async (req, res) => {
     const body = req.body || {};
-    if (typeof body.show_recurring_jobs !== 'boolean') {
-      return res.status(400).json(errBody(
-        'INVALID_PAYLOAD',
-        'show_recurring_jobs must be a boolean.'
-      ));
+    // Accept partial updates — either flag may be sent independently.
+    // At least one recognised key is required or we're just no-op'ing
+    // network traffic.
+    const patch = {};
+    if (body.show_recurring_jobs !== undefined) {
+      if (typeof body.show_recurring_jobs !== 'boolean') {
+        return res.status(400).json(errBody('INVALID_PAYLOAD', 'show_recurring_jobs must be a boolean.'));
+      }
+      patch.proofpix_show_recurring_jobs = body.show_recurring_jobs;
     }
-    const { error } = await supabase
+    if (body.new_customers_only !== undefined) {
+      if (typeof body.new_customers_only !== 'boolean') {
+        return res.status(400).json(errBody('INVALID_PAYLOAD', 'new_customers_only must be a boolean.'));
+      }
+      patch.proofpix_new_customers_only = body.new_customers_only;
+    }
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'No recognised settings fields.'));
+    }
+    const { error: updateErr } = await supabase
       .from('users')
-      .update({ proofpix_show_recurring_jobs: body.show_recurring_jobs })
+      .update(patch)
       .eq('id', req.sfUserId);
-    if (error) {
-      log.error('[ProofPix] /settings write failed:', error.message);
+    if (updateErr) {
+      log.error('[ProofPix] /settings write failed:', updateErr.message);
       return res.status(500).json(errBody('INTERNAL', 'Settings write failed.'));
     }
-    log.log(`[ProofPix] user ${req.sfUserId} set show_recurring_jobs=${body.show_recurring_jobs}`);
+    // Read back the current row so the client always gets the full,
+    // authoritative state — even keys it didn't send.
+    const { data: fresh, error: readErr } = await supabase
+      .from('users')
+      .select('proofpix_show_recurring_jobs, proofpix_new_customers_only')
+      .eq('id', req.sfUserId)
+      .single();
+    if (readErr) {
+      log.warn('[ProofPix] /settings post-write read failed:', readErr.message);
+    }
+    log.log(`[ProofPix] user ${req.sfUserId} settings patch ${JSON.stringify(patch)}`);
     return res.status(200).json({
-      show_recurring_jobs: body.show_recurring_jobs,
+      show_recurring_jobs: !!(fresh && fresh.proofpix_show_recurring_jobs),
+      new_customers_only: !!(fresh && fresh.proofpix_new_customers_only),
     });
   });
 
@@ -1191,16 +1216,17 @@ module.exports = (supabase, logger) => {
     // don't accidentally hide historical work.
     const { data: workspaceSettings, error: settingsErr } = await supabase
       .from('users')
-      .select('proofpix_show_recurring_jobs')
+      .select('proofpix_show_recurring_jobs, proofpix_new_customers_only')
       .eq('id', userId)
       .single();
     if (settingsErr) {
       log.warn('[ProofPix] /jobs settings lookup failed:', settingsErr.message);
-      // Non-fatal — fail closed (hide recurring) to match the default
+      // Non-fatal — fail closed (hide recurring, no first-time filter)
       // rather than accidentally leaking recurring jobs on a transient
       // DB read error.
     }
     const workspaceShowRecurring = !!(workspaceSettings && workspaceSettings.proofpix_show_recurring_jobs);
+    const workspaceNewCustomersOnly = !!(workspaceSettings && workspaceSettings.proofpix_new_customers_only);
     // Per-request override wins when supplied; otherwise fall back to
     // workspace setting.
     const effectiveShowRecurring = includeRecurringOverride != null
@@ -1394,19 +1420,30 @@ module.exports = (supabase, logger) => {
       };
     });
 
+    // New-customers-only workspace filter. Applied AFTER the row shape
+    // because `is_first_job_for_customer` is a post-query computation
+    // (RPC call on the page's customer_ids). Null values (RPC failed or
+    // customer had no other bookings) are treated as NOT first-time so
+    // the mobile picker doesn't fill with "unknowns" when the DB read
+    // hit a transient error.
+    const filteredJobs = workspaceNewCustomersOnly
+      ? jobs.filter((row) => row.is_first_job_for_customer === true)
+      : jobs;
+
     // Echo effective filter state so mobile can reflect it in UI and
     // reason about "why is this list empty" without a separate call to
     // /settings. `workspace_show_recurring_jobs` is the admin's stored
     // default; `include_recurring` is what actually applied to THIS
     // query (override or workspace fallback).
     return res.status(200).json({
-      jobs,
+      jobs: filteredJobs,
       next_cursor: nextCursor,
       filters: {
         status: statusParam,
         since: sinceParam,
         include_recurring: effectiveShowRecurring,
         workspace_show_recurring_jobs: workspaceShowRecurring,
+        new_customers_only: workspaceNewCustomersOnly,
       },
     });
   });
