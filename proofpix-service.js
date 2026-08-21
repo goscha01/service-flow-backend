@@ -200,6 +200,64 @@ module.exports = (supabase, logger) => {
   }
 
   // ─────────────────────────────────────────────────────────────────
+  // Auth: SF user JWT OR ProofPix access token (both admin-scoped).
+  //
+  // Lets the same /settings endpoint serve two callers:
+  //   • SF web (Bearer SF-JWT) — admin managing workspace in browser.
+  //   • ProofPix mobile (Bearer ProofPix access token) — admin on their
+  //     paired device flipping the same setting from Cloud Sync.
+  //
+  // Both paths result in `req.sfUserId` — the workspace-owning user id.
+  // Team-member scoped ProofPix tokens ALSO resolve to the admin's
+  // user_id (they use the admin's refresh token via proxy), which is
+  // fine here because the write scope is `WHERE id = userId` — team
+  // members can only write to their own workspace's settings, which
+  // is intentional per the "admin sees what team sees" invariant. If
+  // stricter role gating is ever needed, add a check on the token's
+  // linked_sf_team_member_id (null = admin-scoped token).
+  // ─────────────────────────────────────────────────────────────────
+  async function requireSfUserJwtOrProofpixAccessToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) {
+      return res.status(401).json(errBody('INVALID_TOKEN', 'Missing Authorization bearer token.'));
+    }
+    // Try SF user JWT first (no audience claim).
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded && decoded.aud !== 'proofpix') {
+        const userId = decoded.userId ?? decoded.id;
+        if (userId != null) {
+          req.sfUserId = Number(userId);
+          return next();
+        }
+      }
+    } catch {
+      // Fall through to ProofPix access-token check below.
+    }
+    // Try ProofPix access token.
+    const result = verifyAccessToken(JWT_SECRET, token);
+    if (!result.ok) {
+      return res.status(401).json(errBody('INVALID_TOKEN', 'Invalid token.'));
+    }
+    const { data: conn, error } = await supabase
+      .from('proofpix_connections')
+      .select('id, user_id, revoked_at')
+      .eq('id', result.connectionId)
+      .eq('user_id', result.userId)
+      .maybeSingle();
+    if (error) {
+      log.error('[ProofPix] combined-auth connection lookup failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Auth check failed.'));
+    }
+    if (!conn || conn.revoked_at) {
+      return res.status(401).json(errBody('INVALID_TOKEN', 'Connection revoked.'));
+    }
+    req.sfUserId = Number(result.userId);
+    next();
+  }
+
+  // ─────────────────────────────────────────────────────────────────
   // Workspace name resolver — business_name → email.
   // ─────────────────────────────────────────────────────────────────
   async function resolveWorkspace(userId) {
@@ -773,7 +831,7 @@ module.exports = (supabase, logger) => {
   //   Auth: SF user JWT (same as /connections). Read-scoped to the
   //   calling admin's own users row.
   // ═════════════════════════════════════════════════════════════════
-  router.get('/settings', requireSfUserJwt, async (req, res) => {
+  router.get('/settings', requireSfUserJwtOrProofpixAccessToken, async (req, res) => {
     const { data, error } = await supabase
       .from('users')
       .select('proofpix_show_recurring_jobs, proofpix_new_customers_only')
@@ -800,7 +858,7 @@ module.exports = (supabase, logger) => {
   //   Auth: SF user JWT. Write-scoped to the calling admin's own
   //   users row (WHERE id = req.sfUserId).
   // ═════════════════════════════════════════════════════════════════
-  router.patch('/settings', requireSfUserJwt, async (req, res) => {
+  router.patch('/settings', requireSfUserJwtOrProofpixAccessToken, async (req, res) => {
     const body = req.body || {};
     // Accept partial updates — either flag may be sent independently.
     // At least one recognised key is required or we're just no-op'ing
