@@ -1041,6 +1041,45 @@ module.exports = (supabase, logger) => {
       return res.status(400).json(errBody('INVALID_PAYLOAD', 'Malformed cursor.'));
     }
 
+    // ?include_recurring=true|false — per-request override of the
+    // workspace-level proofpix_show_recurring_jobs setting. Absent →
+    // fall back to the workspace default. Any value other than the two
+    // strings is a 400 (no coercion — same discipline as PATCH /settings).
+    // The override is NOT a security boundary: recurring jobs are the
+    // same shape as one-off jobs and the workspace toggle is a UX
+    // declutter, not an access-control rule. Mobile can present a
+    // device-local switch that flips this per-request.
+    let includeRecurringOverride = null;
+    if (req.query.include_recurring != null && req.query.include_recurring !== '') {
+      if (req.query.include_recurring === 'true') includeRecurringOverride = true;
+      else if (req.query.include_recurring === 'false') includeRecurringOverride = false;
+      else {
+        return res.status(400).json(errBody(
+          'INVALID_PAYLOAD',
+          'include_recurring must be "true" or "false".'
+        ));
+      }
+    }
+
+    // ?since=YYYY-MM-DD — filter to jobs whose scheduled_date is on or
+    // after the given date. Applied as a string comparison because
+    // jobs.scheduled_date is stored as TEXT (see [project_jobs_scheduled_date_time.md]);
+    // the shared 'YYYY-MM-DD' prefix makes lexicographic >= correct even
+    // when some rows carry an embedded 'YYYY-MM-DD HH:MM:SS' tail.
+    // Absent → no filter (backward compat with existing callers).
+    // Mobile should send today's date (or today - grace window) to hide
+    // stale/zombie open jobs from bulk imports that were never closed.
+    let sinceParam = null;
+    if (req.query.since != null && req.query.since !== '') {
+      if (typeof req.query.since !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(req.query.since)) {
+        return res.status(400).json(errBody(
+          'INVALID_PAYLOAD',
+          'since must be an ISO date (YYYY-MM-DD).'
+        ));
+      }
+      sinceParam = req.query.since;
+    }
+
     // ── Resolve search → customer_ids (same two-step the existing
     //    GET /api/jobs route uses) ─────────────────────────────────
     let searchCustomerIds = null;
@@ -1154,9 +1193,21 @@ module.exports = (supabase, logger) => {
       // rather than accidentally leaking recurring jobs on a transient
       // DB read error.
     }
-    const showRecurring = !!(workspaceSettings && workspaceSettings.proofpix_show_recurring_jobs);
-    if (!showRecurring) {
+    const workspaceShowRecurring = !!(workspaceSettings && workspaceSettings.proofpix_show_recurring_jobs);
+    // Per-request override wins when supplied; otherwise fall back to
+    // workspace setting.
+    const effectiveShowRecurring = includeRecurringOverride != null
+      ? includeRecurringOverride
+      : workspaceShowRecurring;
+    if (!effectiveShowRecurring) {
       query = query.or('is_recurring.is.null,is_recurring.eq.false');
+    }
+
+    // Date-window filter — drops rows whose scheduled_date is before
+    // the requested cutoff. Applied AFTER status/recurring filters so
+    // stale open jobs from historical imports don't leak into mobile.
+    if (sinceParam) {
+      query = query.gte('scheduled_date', sinceParam);
     }
 
     // Search filter
@@ -1336,7 +1387,21 @@ module.exports = (supabase, logger) => {
       };
     });
 
-    return res.status(200).json({ jobs, next_cursor: nextCursor });
+    // Echo effective filter state so mobile can reflect it in UI and
+    // reason about "why is this list empty" without a separate call to
+    // /settings. `workspace_show_recurring_jobs` is the admin's stored
+    // default; `include_recurring` is what actually applied to THIS
+    // query (override or workspace fallback).
+    return res.status(200).json({
+      jobs,
+      next_cursor: nextCursor,
+      filters: {
+        status: statusParam,
+        since: sinceParam,
+        include_recurring: effectiveShowRecurring,
+        workspace_show_recurring_jobs: workspaceShowRecurring,
+      },
+    });
   });
 
   // ═════════════════════════════════════════════════════════════════
