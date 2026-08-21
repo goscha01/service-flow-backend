@@ -78,12 +78,13 @@ function makeFakeSupabase(seed = {}) {
         return parts.every((p) => matchOrClause(row, p));
       }
       // op forms
-      const m = trim.match(/^([\w_]+)\.(eq|lt|gt|le|ge|ilike|in)\.(.+)$/);
+      const m = trim.match(/^([\w_]+)\.(eq|is|lt|gt|le|ge|ilike|in)\.(.+)$/);
       if (!m) return false;
       const [, col, op, raw] = m;
       const val = raw;
       const cell = row[col];
       if (op === 'eq') return String(cell) === String(val);
+      if (op === 'is') return val === 'null' ? cell == null : cell === val;
       if (op === 'lt') return cell != null && String(cell) < String(val);
       if (op === 'gt') return cell != null && String(cell) > String(val);
       if (op === 'ilike') {
@@ -1351,5 +1352,49 @@ describe('GET /jobs — is_first_job_for_customer', () => {
     const firstJobCalls = supa._rpcCalls.filter((c) => c.name === 'proofpix_customer_first_job');
     expect(firstJobCalls).toHaveLength(1);
     expect(firstJobCalls[0].args.p_customer_ids.sort()).toEqual([401, 402]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Recurring-job visibility filter (migration 079 + /settings toggle)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('GET /jobs — recurring-job visibility', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('default (flag off) hides is_recurring=true jobs; keeps false + NULL', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],  // no flag column → falsy → hide
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 700, status: 'confirmed', is_recurring: true }),        // hidden
+        makeJob({ id: 701, status: 'confirmed', is_recurring: false }),       // shown
+        makeJob({ id: 702, status: 'confirmed' }),                            // is_recurring absent → NULL → shown
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.jobs.map((j) => j.id).sort();
+    expect(ids).toEqual(['701', '702']);
+  });
+
+  test('flag on (users.proofpix_show_recurring_jobs=true) surfaces recurring jobs', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b', proofpix_show_recurring_jobs: true }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 700, status: 'confirmed', is_recurring: true }),
+        makeJob({ id: 701, status: 'confirmed', is_recurring: false }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.jobs.map((j) => j.id).sort();
+    expect(ids).toEqual(['700', '701']);
   });
 });

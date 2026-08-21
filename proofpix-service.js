@@ -762,6 +762,66 @@ module.exports = (supabase, logger) => {
   });
 
   // ═════════════════════════════════════════════════════════════════
+  // GET /settings
+  //   Per-workspace ProofPix integration settings. Currently exposes
+  //   one toggle:
+  //     show_recurring_jobs — whether the /jobs endpoint surfaces
+  //     jobs.is_recurring=true to any ProofPix caller (team members
+  //     + admin's own device). Default false so recurring cleanings
+  //     stay off the team's phones until the admin opts in.
+  //
+  //   Auth: SF user JWT (same as /connections). Read-scoped to the
+  //   calling admin's own users row.
+  // ═════════════════════════════════════════════════════════════════
+  router.get('/settings', requireSfUserJwt, async (req, res) => {
+    const { data, error } = await supabase
+      .from('users')
+      .select('proofpix_show_recurring_jobs')
+      .eq('id', req.sfUserId)
+      .single();
+    if (error) {
+      log.error('[ProofPix] /settings read failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Settings read failed.'));
+    }
+    return res.status(200).json({
+      show_recurring_jobs: !!(data && data.proofpix_show_recurring_jobs),
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // PATCH /settings
+  //   Update the ProofPix integration settings for the caller's
+  //   workspace. Currently accepts { show_recurring_jobs: boolean }.
+  //   Rejects unknown keys / non-boolean values with 400 — never
+  //   coerces, so a client-side bug can't accidentally toggle the
+  //   flag on/off without an explicit boolean.
+  //
+  //   Auth: SF user JWT. Write-scoped to the calling admin's own
+  //   users row (WHERE id = req.sfUserId).
+  // ═════════════════════════════════════════════════════════════════
+  router.patch('/settings', requireSfUserJwt, async (req, res) => {
+    const body = req.body || {};
+    if (typeof body.show_recurring_jobs !== 'boolean') {
+      return res.status(400).json(errBody(
+        'INVALID_PAYLOAD',
+        'show_recurring_jobs must be a boolean.'
+      ));
+    }
+    const { error } = await supabase
+      .from('users')
+      .update({ proofpix_show_recurring_jobs: body.show_recurring_jobs })
+      .eq('id', req.sfUserId);
+    if (error) {
+      log.error('[ProofPix] /settings write failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Settings write failed.'));
+    }
+    log.log(`[ProofPix] user ${req.sfUserId} set show_recurring_jobs=${body.show_recurring_jobs}`);
+    return res.status(200).json({
+      show_recurring_jobs: body.show_recurring_jobs,
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
   // GET /connection/status
   //   Cheap probe ProofPix-native uses to test "is this admin still
   //   connected" without making a real upload.
@@ -1072,6 +1132,32 @@ module.exports = (supabase, logger) => {
       query = query.eq('status', 'scheduled');
     }
     // 'all' → no filter.
+
+    // Recurring-job visibility filter. Workspace default (see migration
+    // 079) is to hide jobs.is_recurring=true from ProofPix entirely —
+    // team members only see one-time / first-clean projects. Admin
+    // opts in via PATCH /settings. Applies uniformly to every /jobs
+    // caller (team_member scope, admin scope, per-request team_member_id
+    // proxy) — the deliberate rule is "admin sees what team members
+    // see" so the admin can preview visibility from their own device.
+    //
+    // Include NULL rows (legacy pre-flag data) as non-recurring so we
+    // don't accidentally hide historical work.
+    const { data: workspaceSettings, error: settingsErr } = await supabase
+      .from('users')
+      .select('proofpix_show_recurring_jobs')
+      .eq('id', userId)
+      .single();
+    if (settingsErr) {
+      log.warn('[ProofPix] /jobs settings lookup failed:', settingsErr.message);
+      // Non-fatal — fail closed (hide recurring) to match the default
+      // rather than accidentally leaking recurring jobs on a transient
+      // DB read error.
+    }
+    const showRecurring = !!(workspaceSettings && workspaceSettings.proofpix_show_recurring_jobs);
+    if (!showRecurring) {
+      query = query.or('is_recurring.is.null,is_recurring.eq.false');
+    }
 
     // Search filter
     if (search) {
