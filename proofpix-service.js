@@ -850,6 +850,12 @@ module.exports = (supabase, logger) => {
   //   Auth: ProofPix access token — same envelope as /jobs. Scoped
   //   to req.proofpix.userId (the workspace owner). Active members
   //   only. No pagination — workspaces are ≤ tens of members.
+  //
+  //   Managers filtered out (2026-08-21): field/office split — managers
+  //   don't take before/after photos and shouldn't clutter the ProofPix
+  //   invite picker or the Team-tab cleaner-filter chips. Account owner
+  //   + null-role rows pass through (owner may still self-invite as a
+  //   worker; null-role rows are treated as workers by legacy default).
   // ═════════════════════════════════════════════════════════════════
   router.get('/sf-team-members', requireProofpixAccessToken, async (req, res) => {
     const userId = req.proofpix.userId;
@@ -858,6 +864,7 @@ module.exports = (supabase, logger) => {
       .select('id, first_name, last_name, email, role, status')
       .eq('user_id', userId)
       .eq('status', 'active')
+      .neq('role', 'manager')
       .order('first_name', { ascending: true });
     if (error) {
       log.error('[ProofPix] /sf-team-members lookup failed:', error.message);

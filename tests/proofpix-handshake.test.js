@@ -65,6 +65,7 @@ function makeFakeSupabase(seed = {}) {
       if (kind === 'is') return v === null ? row[k] == null : row[k] === v;
       if (kind === 'in') return Array.isArray(v) && v.some((x) => String(row[k]) === String(x));
       if (kind === 'lt') return row[k] != null && Number(row[k]) < Number(v);
+      if (kind === 'neq') return String(row[k]) !== String(v);
       return false;
     });
   }
@@ -83,6 +84,7 @@ function makeFakeSupabase(seed = {}) {
         is(k, v) { filters.push(['is', k, v]); return api; },
         in(k, v) { filters.push(['in', k, v]); return api; },
         lt(k, v) { filters.push(['lt', k, v]); return api; },
+        neq(k, v) { filters.push(['neq', k, v]); return api; },
         limit(n) { rowLimit = n; return api; },
         order(k, opts) {
           orderKey = k;
