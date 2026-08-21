@@ -39,6 +39,8 @@ function makeFakeSupabase(seed = {}) {
     customers: [...(seed.customers || [])],
     customer_files: [...(seed.customer_files || [])],
     proofpix_connections: [...(seed.proofpix_connections || [])],
+    job_team_assignments: [...(seed.job_team_assignments || [])],
+    team_members: [...(seed.team_members || [])],
   };
   const rpcCalls = [];
 
@@ -76,12 +78,13 @@ function makeFakeSupabase(seed = {}) {
         return parts.every((p) => matchOrClause(row, p));
       }
       // op forms
-      const m = trim.match(/^([\w_]+)\.(eq|lt|gt|le|ge|ilike|in)\.(.+)$/);
+      const m = trim.match(/^([\w_]+)\.(eq|is|lt|gt|le|ge|ilike|in)\.(.+)$/);
       if (!m) return false;
       const [, col, op, raw] = m;
       const val = raw;
       const cell = row[col];
       if (op === 'eq') return String(cell) === String(val);
+      if (op === 'is') return val === 'null' ? cell == null : cell === val;
       if (op === 'lt') return cell != null && String(cell) < String(val);
       if (op === 'gt') return cell != null && String(cell) > String(val);
       if (op === 'ilike') {
@@ -189,6 +192,31 @@ function makeFakeSupabase(seed = {}) {
         photo_count: Number(photo_count),
       }));
       return { data, error: null };
+    }
+    if (name === 'proofpix_customer_first_job') {
+      // Mirror migration 077: for each (workspace, customer) in
+      // p_customer_ids, return the earliest non-cancelled
+      // (scheduled_date, id) tuple.
+      const { p_user_id, p_customer_ids } = args;
+      const earliestByCustomer = new Map();
+      for (const j of db.jobs) {
+        if (j.user_id !== p_user_id) continue;
+        if (j.customer_id == null || !p_customer_ids.includes(j.customer_id)) continue;
+        if (j.status === 'cancelled') continue;
+        const prior = earliestByCustomer.get(j.customer_id);
+        // Lexicographic on scheduled_date (safe: shared 'YYYY-MM-DD'
+        // prefix), then id ascending.
+        if (!prior
+          || j.scheduled_date < prior.scheduled_date
+          || (j.scheduled_date === prior.scheduled_date && j.id < prior.job_id)) {
+          earliestByCustomer.set(j.customer_id, {
+            customer_id: j.customer_id,
+            scheduled_date: j.scheduled_date,
+            job_id: j.id,
+          });
+        }
+      }
+      return { data: Array.from(earliestByCustomer.values()), error: null };
     }
     return { data: null, error: { message: 'unknown rpc' } };
   }
@@ -302,11 +330,64 @@ describe('GET /jobs — shape and fields', () => {
       id: '100',
       title: 'Standard Cleaning',
       customer_name: 'Sarah Lopez',
+      customer_id: 50,
+      is_first_job_for_customer: true,
       address: '123 Main St, Austin, TX 78701',
       status: 'active',
       scheduled_at: Date.parse('2026-07-15T09:00:00'),
       photo_count: 2,
+      team_member_id: null,
+      team_member_ids: [],
     });
+  });
+
+  test('team_member_id + team_member_ids populate from jobs.team_member_id and job_team_assignments', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 100, team_member_id: 42 }),                    // primary only
+        makeJob({ id: 101, team_member_id: null }),                  // no primary, only via join
+        makeJob({ id: 102, team_member_id: 42 }),                    // primary + co-assignees
+        makeJob({ id: 103, team_member_id: null }),                  // completely unassigned
+      ],
+      job_team_assignments: [
+        { id: 1, job_id: 101, team_member_id: 43, is_primary: true },
+        { id: 2, job_id: 102, team_member_id: 44, is_primary: false },
+        { id: 3, job_id: 102, team_member_id: 45, is_primary: false },
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const byId = new Map(res.body.jobs.map((j) => [Number(j.id), j]));
+    expect(byId.get(100)).toMatchObject({ team_member_id: 42, team_member_ids: [] });
+    expect(byId.get(101)).toMatchObject({ team_member_id: null, team_member_ids: [43] });
+    expect(byId.get(102)).toMatchObject({
+      team_member_id: 42,
+      team_member_ids: expect.arrayContaining([44, 45]),
+    });
+    expect(byId.get(102).team_member_ids).toHaveLength(2);
+    expect(byId.get(103)).toMatchObject({ team_member_id: null, team_member_ids: [] });
+  });
+
+  test('team_member_ids dedupes if the same member appears twice in job_team_assignments', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [makeJob({ id: 100, team_member_id: null })],
+      job_team_assignments: [
+        { id: 1, job_id: 100, team_member_id: 42, is_primary: true },
+        { id: 2, job_id: 100, team_member_id: 42, is_primary: false },  // duplicate — should dedupe
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.body.jobs[0].team_member_ids).toEqual([42]);
   });
 
   test('title falls back to Job #<id> when service_name is null/empty', async () => {
@@ -395,12 +476,54 @@ describe('GET /jobs — shape and fields', () => {
     expect(res.body.jobs[0].scheduled_at).toBe(Date.parse('2026-07-15T09:00:00'));
   });
 
-  test('scheduled_at handles "YYYY-MM-DD HH:MM:SS" format in scheduled_date (ZB sync legacy data)', async () => {
+  test('scheduled_at prefers the time embedded in scheduled_date over scheduled_time (filler avoidance)', async () => {
+    // Live SF data (per prod audit 2026-07-28): scheduled_time is
+    // often a default '09:00:00' filler while the real appointment
+    // time lives embedded in scheduled_date as 'YYYY-MM-DD HH:MM:SS'.
+    // Prior mapper stripped the embedded time and used the filler,
+    // collapsing every job to 09:00 → sort ties. Fix: honor
+    // embedded time when present; fall back to scheduled_time only
+    // for bare 'YYYY-MM-DD' dates.
     const supa = makeFakeSupabase({
       users: [{ id: 1, business_name: 'A', email: 'a@b' }],
       proofpix_connections: [seedConnection(1)],
       jobs: [makeJob({
-        scheduled_date: '2026-05-16 09:00:00',   // not just YYYY-MM-DD
+        scheduled_date: '2026-05-16 14:30:00',   // embedded time is authoritative
+        scheduled_time: '09:00:00',              // filler — should NOT win
+      })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`)
+      .send();
+    expect(res.body.jobs[0].scheduled_at).toBe(Date.parse('2026-05-16T14:30:00'));
+  });
+
+  test('scheduled_at handles HH:MM (no seconds) embedded in scheduled_date', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [makeJob({
+        scheduled_date: '2026-05-16 15:00',    // ambiguous separator, no seconds
+        scheduled_time: '09:00:00',
+      })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`)
+      .send();
+    expect(res.body.jobs[0].scheduled_at).toBe(Date.parse('2026-05-16T15:00:00'));
+  });
+
+  test('scheduled_at falls back to scheduled_time for bare YYYY-MM-DD dates', async () => {
+    // Bare date (no embedded time) → scheduled_time is the source of truth.
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [makeJob({
+        scheduled_date: '2026-05-16',
         scheduled_time: '14:30:00',
       })],
     });
@@ -526,6 +649,25 @@ describe('GET /jobs — status mapping + filter', () => {
     expect(res.body.jobs).toHaveLength(12);
     const buckets = new Set(res.body.jobs.map((j) => j.status));
     expect(buckets).toEqual(new Set(['active', 'completed', 'cancelled', 'scheduled']));
+  });
+
+  test('?status=open returns active ∪ scheduled (matches SF web default list)', async () => {
+    const app = makeApp(mixedSupa());
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=open&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`)
+      .send();
+    // 7 active (pending, confirmed, in-progress, rescheduled, en-route,
+    // started, late) + 1 scheduled = 8. No completed/complete/paid/cancelled.
+    expect(res.body.jobs).toHaveLength(8);
+    const buckets = new Set(res.body.jobs.map((j) => j.status));
+    expect(buckets).toEqual(new Set(['active', 'scheduled']));
+    // Explicit sanity: ids 4/5/6/7 (completed/complete/paid/cancelled) excluded.
+    const ids = res.body.jobs.map((j) => Number(j.id));
+    expect(ids).not.toContain(4);
+    expect(ids).not.toContain(5);
+    expect(ids).not.toContain(6);
+    expect(ids).not.toContain(7);
   });
 
   test('?status=junk → 400 INVALID_PAYLOAD', async () => {
@@ -792,5 +934,467 @@ describe('GET /jobs — auth', () => {
       .set('Authorization', `Bearer ${accessTokenFor(1)}`)
       .send();
     expect(res.status).toBe(401);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Team-member scoping — a device linked to a specific SF team member
+// only sees jobs assigned to them (via jobs.team_member_id OR
+// job_team_assignments join table).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('GET /jobs — linked_sf_team_member scoping', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('unlinked (admin) connection sees ALL workspace jobs (baseline)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],   // linked_sf_team_member_id absent → null
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: null }),
+        makeJob({ id: 101, status: 'pending', team_member_id: 42 }),
+        makeJob({ id: 102, status: 'pending', team_member_id: 99 }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id)).sort()).toEqual([100, 101, 102]);
+  });
+
+  test('linked connection filters via jobs.team_member_id (single-assignee path)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: null }),
+        makeJob({ id: 101, status: 'pending', team_member_id: 42 }),   // ← Sarah
+        makeJob({ id: 102, status: 'pending', team_member_id: 99 }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id))).toEqual([101]);
+  });
+
+  test('linked connection also picks up jobs via job_team_assignments (multi-assignee path)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      jobs: [
+        // Only direct-assigned via team_member_id
+        makeJob({ id: 100, status: 'pending', team_member_id: 42 }),
+        // Only assigned via job_team_assignments (jobs.team_member_id = null)
+        makeJob({ id: 101, status: 'pending', team_member_id: null }),
+        // Not assigned to Sarah at all
+        makeJob({ id: 102, status: 'pending', team_member_id: null }),
+      ],
+      job_team_assignments: [
+        { id: 1, job_id: 101, team_member_id: 42, is_primary: true },
+        { id: 2, job_id: 102, team_member_id: 99, is_primary: true },   // different member
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    // Union: 100 (direct) + 101 (via assignments) — but NOT 102.
+    expect(res.body.jobs.map((j) => Number(j.id)).sort()).toEqual([100, 101]);
+  });
+
+  test('linked connection with no assignments at all → empty list', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: null }),
+        makeJob({ id: 101, status: 'pending', team_member_id: 99 }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs).toEqual([]);
+  });
+
+  test('per-request ?team_member_id filters an admin-scope connection (proxy pattern)', async () => {
+    // Admin-scope connection (linked_sf_team_member_id null) — proxy
+    // adds ?team_member_id=X on each call to route to that cleaner
+    // without re-pairing.
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],   // no linked_sf_team_member_id
+      team_members: [{ id: 42, user_id: 1, first_name: 'Sarah', status: 'active' }],
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: null }),
+        makeJob({ id: 101, status: 'pending', team_member_id: 42 }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all&team_member_id=42')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id))).toEqual([101]);
+  });
+
+  test('per-request ?team_member_id must belong to caller workspace (400 for cross-tenant)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }, { id: 2, business_name: 'B', email: 'b@b' }],
+      proofpix_connections: [seedConnection(1)],
+      team_members: [{ id: 200, user_id: 2, first_name: 'Other', status: 'active' }],   // owned by user 2
+      jobs: [makeJob({ id: 100, status: 'pending', team_member_id: 200 })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?team_member_id=200')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_TEAM_MEMBER');
+  });
+
+  test('per-request ?team_member_id on scoped connection: mismatch → 403', async () => {
+    // Scoped-pair invariant — connection is pinned to Sarah (42);
+    // the proxy can't reroute to Mike (43) on this connection.
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      team_members: [
+        { id: 42, user_id: 1, first_name: 'Sarah', status: 'active' },
+        { id: 43, user_id: 1, first_name: 'Mike',  status: 'active' },
+      ],
+      jobs: [makeJob({ id: 100, status: 'pending', team_member_id: 43 })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?team_member_id=43')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  test('per-request ?team_member_id on scoped connection: match → OK (filters as usual)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      team_members: [{ id: 42, user_id: 1, first_name: 'Sarah', status: 'active' }],
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: 42 }),
+        makeJob({ id: 101, status: 'pending', team_member_id: null }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all&team_member_id=42')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id))).toEqual([100]);
+  });
+
+  test('team-member scope composes with status filter (only Sarah\'s active jobs)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      jobs: [
+        makeJob({ id: 100, status: 'completed', team_member_id: 42 }),   // Sarah's but wrong status
+        makeJob({ id: 101, status: 'in-progress', team_member_id: 42 }), // Sarah's active
+        makeJob({ id: 102, status: 'in-progress', team_member_id: 99 }), // active but not Sarah's
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=active')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id))).toEqual([101]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// is_first_job_for_customer — semantics per migration 077
+// ─────────────────────────────────────────────────────────────────────
+
+describe('GET /jobs — is_first_job_for_customer', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('customer with a single non-cancelled job → true', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 200, user_id: 1, first_name: 'Ada', last_name: 'One' }],
+      jobs: [makeJob({ id: 500, customer_id: 200, status: 'confirmed', scheduled_date: '2026-08-15' })],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.find((j) => j.id === '500').is_first_job_for_customer).toBe(true);
+  });
+
+  test('customer with 3 jobs → only the earliest returns true', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 201, user_id: 1, first_name: 'Ben', last_name: 'Two' }],
+      jobs: [
+        makeJob({ id: 610, customer_id: 201, status: 'confirmed', scheduled_date: '2026-08-01' }),
+        makeJob({ id: 611, customer_id: 201, status: 'confirmed', scheduled_date: '2026-08-15' }),
+        makeJob({ id: 612, customer_id: 201, status: 'confirmed', scheduled_date: '2026-08-30' }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const flags = Object.fromEntries(res.body.jobs.map((j) => [j.id, j.is_first_job_for_customer]));
+    expect(flags['610']).toBe(true);
+    expect(flags['611']).toBe(false);
+    expect(flags['612']).toBe(false);
+  });
+
+  test('cancelled earlier booking does not consume first — next real booking is first', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 202, user_id: 1, first_name: 'Cara', last_name: 'Three' }],
+      jobs: [
+        makeJob({ id: 700, customer_id: 202, status: 'cancelled', scheduled_date: '2026-08-01' }),
+        makeJob({ id: 701, customer_id: 202, status: 'confirmed', scheduled_date: '2026-08-10' }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const flags = Object.fromEntries(res.body.jobs.map((j) => [j.id, j.is_first_job_for_customer]));
+    expect(flags['700']).toBe(false); // cancelled → always false
+    expect(flags['701']).toBe(true);  // next real booking is first
+  });
+
+  test('a cancelled job itself is never first, even when it is the only row', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 203, user_id: 1, first_name: 'Dana', last_name: 'Four' }],
+      jobs: [
+        makeJob({ id: 800, customer_id: 203, status: 'cancelled', scheduled_date: '2026-08-05' }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.find((j) => j.id === '800').is_first_job_for_customer).toBe(false);
+  });
+
+  test('same job re-fetched returns the same flag (deterministic)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 204, user_id: 1, first_name: 'Ed', last_name: 'Five' }],
+      jobs: [
+        makeJob({ id: 910, customer_id: 204, status: 'confirmed', scheduled_date: '2026-08-01' }),
+        makeJob({ id: 911, customer_id: 204, status: 'confirmed', scheduled_date: '2026-08-20' }),
+      ],
+    });
+    const app = makeApp(supa);
+    const first = await request(app).get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    const second = await request(app).get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const flags = (r) => Object.fromEntries(r.body.jobs.map((j) => [j.id, j.is_first_job_for_customer]));
+    expect(flags(second)).toEqual(flags(first));
+  });
+
+  test('same date + different ids → deterministic tie-breaker on lower id', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 205, user_id: 1, first_name: 'Fay', last_name: 'Six' }],
+      jobs: [
+        makeJob({ id: 950, customer_id: 205, status: 'confirmed', scheduled_date: '2026-08-15' }),
+        makeJob({ id: 951, customer_id: 205, status: 'confirmed', scheduled_date: '2026-08-15' }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const flags = Object.fromEntries(res.body.jobs.map((j) => [j.id, j.is_first_job_for_customer]));
+    expect(flags['950']).toBe(true);
+    expect(flags['951']).toBe(false);
+  });
+
+  test('workspace isolation: same customer_id in another workspace never affects flag', async () => {
+    // customer_id 300 exists in both workspaces. Workspace 1's earliest
+    // is 2026-08-20; workspace 2's earliest is 2026-01-01. Workspace 1's
+    // job should still be first for workspace 1, even though a chronologically
+    // earlier row exists under the same customer_id in workspace 2.
+    const supa = makeFakeSupabase({
+      users: [
+        { id: 1, business_name: 'A', email: 'a@b' },
+        { id: 2, business_name: 'B', email: 'b@c' },
+      ],
+      proofpix_connections: [seedConnection(1), seedConnection(2, 2)],
+      customers: [
+        { id: 300, user_id: 1, first_name: 'Cross', last_name: 'One' },
+        { id: 300, user_id: 2, first_name: 'Cross', last_name: 'Two' },
+      ],
+      jobs: [
+        makeJob({ id: 1200, user_id: 1, customer_id: 300, status: 'confirmed', scheduled_date: '2026-08-20' }),
+        makeJob({ id: 1201, user_id: 2, customer_id: 300, status: 'confirmed', scheduled_date: '2026-01-01' }),
+      ],
+    });
+    const app = makeApp(supa);
+    const w1 = await request(app).get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(w1.status).toBe(200);
+    expect(w1.body.jobs.find((j) => j.id === '1200').is_first_job_for_customer).toBe(true);
+    const w2 = await request(app).get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(2, 2)}`);
+    expect(w2.status).toBe(200);
+    expect(w2.body.jobs.find((j) => j.id === '1201').is_first_job_for_customer).toBe(true);
+  });
+
+  test('customer_id present on the response even when is_first flag lookup empty', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 301, user_id: 1, first_name: 'Gil', last_name: 'Seven' }],
+      jobs: [makeJob({ id: 1300, customer_id: 301, status: 'confirmed', scheduled_date: '2026-08-15' })],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs[0].customer_id).toBe(301);
+  });
+
+  test('is_first_job_for_customer is null when RPC fails (mobile then fails safely)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 302, user_id: 1, first_name: 'Ivy', last_name: 'Eight' }],
+      jobs: [makeJob({ id: 1400, customer_id: 302, status: 'confirmed', scheduled_date: '2026-08-15' })],
+    });
+    // Override rpc — force proofpix_customer_first_job to fail while
+    // photo-count still succeeds so the rest of the response is intact.
+    const origRpc = supa.rpc;
+    supa.rpc = async (name, args) => {
+      if (name === 'proofpix_customer_first_job') return { data: null, error: { message: 'boom' } };
+      return origRpc(name, args);
+    };
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs[0].is_first_job_for_customer).toBe(null);
+    // customer_id must remain populated so the mobile side can still
+    // identify the customer even when the first-job lookup failed.
+    expect(res.body.jobs[0].customer_id).toBe(302);
+  });
+
+  test('rescheduled status is treated as non-cancelled (consumes first)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [{ id: 303, user_id: 1, first_name: 'Jo', last_name: 'Nine' }],
+      jobs: [
+        makeJob({ id: 1500, customer_id: 303, status: 'rescheduled', scheduled_date: '2026-08-01' }),
+        makeJob({ id: 1501, customer_id: 303, status: 'confirmed', scheduled_date: '2026-08-20' }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const flags = Object.fromEntries(res.body.jobs.map((j) => [j.id, j.is_first_job_for_customer]));
+    expect(flags['1500']).toBe(true);  // rescheduled counts
+    expect(flags['1501']).toBe(false);
+  });
+
+  test('page-scoped RPC — customers OUTSIDE the current page do not appear in the lookup', async () => {
+    // Two customers; small page size = 1. Both should still get correct
+    // flags across two page fetches because each request scopes the RPC
+    // to that page's customer_ids.
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      customers: [
+        { id: 401, user_id: 1, first_name: 'Ken', last_name: 'A' },
+        { id: 402, user_id: 1, first_name: 'Liz', last_name: 'B' },
+      ],
+      jobs: [
+        makeJob({ id: 1600, customer_id: 401, status: 'confirmed', scheduled_date: '2026-08-10' }),
+        makeJob({ id: 1601, customer_id: 402, status: 'confirmed', scheduled_date: '2026-08-11' }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const flags = Object.fromEntries(res.body.jobs.map((j) => [j.id, j.is_first_job_for_customer]));
+    expect(flags['1600']).toBe(true);
+    expect(flags['1601']).toBe(true);
+    // Sanity: no N+1 — one RPC call for photo counts, one for first-job.
+    const firstJobCalls = supa._rpcCalls.filter((c) => c.name === 'proofpix_customer_first_job');
+    expect(firstJobCalls).toHaveLength(1);
+    expect(firstJobCalls[0].args.p_customer_ids.sort()).toEqual([401, 402]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Recurring-job visibility filter (migration 079 + /settings toggle)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('GET /jobs — recurring-job visibility', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('default (flag off) hides is_recurring=true jobs; keeps false + NULL', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],  // no flag column → falsy → hide
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 700, status: 'confirmed', is_recurring: true }),        // hidden
+        makeJob({ id: 701, status: 'confirmed', is_recurring: false }),       // shown
+        makeJob({ id: 702, status: 'confirmed' }),                            // is_recurring absent → NULL → shown
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.jobs.map((j) => j.id).sort();
+    expect(ids).toEqual(['701', '702']);
+  });
+
+  test('flag on (users.proofpix_show_recurring_jobs=true) surfaces recurring jobs', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b', proofpix_show_recurring_jobs: true }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 700, status: 'confirmed', is_recurring: true }),
+        makeJob({ id: 701, status: 'confirmed', is_recurring: false }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.jobs.map((j) => j.id).sort();
+    expect(ids).toEqual(['700', '701']);
   });
 });

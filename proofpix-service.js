@@ -8,8 +8,11 @@
  *   - POST /connect/code/issue            (SF user JWT)
  *   - POST /connect/code/redeem           (no auth — code is the credential)
  *   - POST /connect/refresh               (no auth — refresh token is the credential)
+ *   - GET  /connections                   (SF user JWT — lists caller's active devices)
+ *   - DELETE /connections/:id             (SF user JWT — admin revoke of a specific device)
  *   - GET  /connection/status             (ProofPix access token)
  *   - DELETE /connection                  (ProofPix access token; idempotent)
+ *   - GET  /sf-team-members               (ProofPix access token — SF's own team_members list for invite-flow picker)
  *
  * PR 2 — jobs list:
  *   - GET /jobs                           (ProofPix access token)
@@ -24,6 +27,10 @@
  * PR 4 — same-device pairing:
  *   - POST /connect/token/issue           (SF user JWT)
  *     Mints a base64url single-use token (60s TTL) for deep-link pairing.
+ *   - GET  /connect/token/status?token=…  (token-as-capability, no auth)
+ *     Pollable status probe for the SF web authorize page. Returns one
+ *     of pending | redeemed | expired | unknown. 'unknown' collapses
+ *     malformed-shape AND not-in-DB to prevent enumeration.
  *   - POST /connect/redeem                (no auth — credential in body)
  *     Canonical redeem. Accepts both 16-char codes AND base64url tokens
  *     via shape discrimination.
@@ -53,6 +60,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 const path = require('path');
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
 
 const { BUCKETS } = require('./supabase-storage');
 const { FLAGS, isEnabled } = require('./lib/feature-flags');
@@ -165,9 +173,12 @@ module.exports = (supabase, logger) => {
       return res.status(401).json(errBody('INVALID_TOKEN', msg));
     }
     // Connection must still be active (not revoked, not deleted).
+    // Also pull linked_sf_team_member_id so downstream routes (/jobs
+    // especially) can scope their responses to the linked team member
+    // without an extra roundtrip.
     const { data: conn, error } = await supabase
       .from('proofpix_connections')
-      .select('id, user_id, revoked_at')
+      .select('id, user_id, linked_sf_team_member_id, revoked_at')
       .eq('id', result.connectionId)
       .eq('user_id', result.userId)
       .maybeSingle();
@@ -178,7 +189,13 @@ module.exports = (supabase, logger) => {
     if (!conn || conn.revoked_at) {
       return res.status(401).json(errBody('INVALID_TOKEN', 'Connection revoked.'));
     }
-    req.proofpix = { userId: result.userId, connectionId: result.connectionId };
+    req.proofpix = {
+      userId: result.userId,
+      connectionId: result.connectionId,
+      linkedSfTeamMemberId: conn.linked_sf_team_member_id != null
+        ? Number(conn.linked_sf_team_member_id)
+        : null,
+    };
     next();
   }
 
@@ -197,19 +214,71 @@ module.exports = (supabase, logger) => {
   }
 
   // ═════════════════════════════════════════════════════════════════
+  // Team-member ownership validator — the admin's connect-flow can
+  // scope a pair to a specific team member by passing for_team_member_id
+  // in the body. We verify the member actually belongs to this
+  // workspace AND is active before persisting the link. Returns:
+  //   { ok: true, teamMemberId: <number> }  — validated & active
+  //   { ok: true, teamMemberId: null }      — caller didn't supply one
+  //                                            (admin scope, no filter)
+  //   { ok: false, status, code, message }  — rejected
+  // Cross-workspace and unknown-id both collapse to INVALID_TEAM_MEMBER
+  // (400) — same shape, no existence leak.
+  // ═════════════════════════════════════════════════════════════════
+  async function resolveForTeamMemberId(rawInput, ownerUserId) {
+    if (rawInput == null || rawInput === '') {
+      return { ok: true, teamMemberId: null };
+    }
+    const teamMemberId = Number(rawInput);
+    if (!Number.isFinite(teamMemberId) || teamMemberId <= 0) {
+      return { ok: false, status: 400, code: 'INVALID_PAYLOAD', message: 'Malformed for_team_member_id.' };
+    }
+    const { data: row, error } = await supabase
+      .from('team_members')
+      .select('id, user_id, status')
+      .eq('id', teamMemberId)
+      .maybeSingle();
+    if (error) {
+      log.error('[ProofPix] team_members lookup failed:', error.message);
+      return { ok: false, status: 500, code: 'INTERNAL', message: 'Team member lookup failed.' };
+    }
+    if (!row || Number(row.user_id) !== Number(ownerUserId)) {
+      return { ok: false, status: 400, code: 'INVALID_TEAM_MEMBER', message: 'Team member not found in this workspace.' };
+    }
+    if (row.status && row.status !== 'active') {
+      return { ok: false, status: 400, code: 'INVALID_TEAM_MEMBER', message: 'Team member is not active.' };
+    }
+    return { ok: true, teamMemberId };
+  }
+
+  // ═════════════════════════════════════════════════════════════════
   // POST /connect/code/issue
   //   SF web UI calls this on behalf of an authenticated admin to mint
   //   a fresh code. The admin then pastes the code into the ProofPix
   //   mobile app's connect screen.
+  //
+  //   Optional body { for_team_member_id: <int> } scopes the pair to
+  //   a specific SF team member — that member's jobs will be the only
+  //   ones visible from the resulting device. Omit / null / 0 = admin
+  //   scope (device sees all workspace jobs).
   // ═════════════════════════════════════════════════════════════════
   router.post('/connect/code/issue', requireSfUserJwt, async (req, res) => {
     const userId = req.sfUserId;
+    const forTM = await resolveForTeamMemberId(req.body && req.body.for_team_member_id, userId);
+    if (!forTM.ok) {
+      return res.status(forTM.status).json(errBody(forTM.code, forTM.message));
+    }
     const code = newConnectCode();
     const expiresAt = new Date(Date.now() + CODE_TTL_MS).toISOString();
 
     const { error } = await supabase
       .from('proofpix_connect_codes')
-      .insert({ code, user_id: userId, expires_at: expiresAt });
+      .insert({
+        code,
+        user_id: userId,
+        linked_sf_team_member_id: forTM.teamMemberId,
+        expires_at: expiresAt,
+      });
 
     if (error) {
       // Collision on the PK is astronomically unlikely with 80-bit
@@ -218,7 +287,7 @@ module.exports = (supabase, logger) => {
       return res.status(500).json(errBody('INTERNAL', 'Failed to issue code.'));
     }
 
-    log.log(`[ProofPix] issued connect code for user ${userId}`);
+    log.log(`[ProofPix] issued connect code for user ${userId} tm=${forTM.teamMemberId ?? '-'}`);
     return res.status(200).json({
       code,
       expires_in: Math.floor(CODE_TTL_MS / 1000),
@@ -234,26 +303,93 @@ module.exports = (supabase, logger) => {
   //
   //   60-second TTL — much shorter than the 16-char code (which is
   //   typed by hand) because the deep-link flow consumes it instantly.
+  //
+  //   Optional body { for_team_member_id: <int> } scopes the pair to
+  //   a specific SF team member (same semantics as /connect/code/issue).
   // ═════════════════════════════════════════════════════════════════
   router.post('/connect/token/issue', requireSfUserJwt, async (req, res) => {
     const userId = req.sfUserId;
+    const forTM = await resolveForTeamMemberId(req.body && req.body.for_team_member_id, userId);
+    if (!forTM.ok) {
+      return res.status(forTM.status).json(errBody(forTM.code, forTM.message));
+    }
     const token = newConnectToken();
     const expiresAt = new Date(Date.now() + CONNECT_TOKEN_TTL_MS).toISOString();
 
     const { error } = await supabase
       .from('proofpix_connect_codes')
-      .insert({ code: token, user_id: userId, expires_at: expiresAt });
+      .insert({
+        code: token,
+        user_id: userId,
+        linked_sf_team_member_id: forTM.teamMemberId,
+        expires_at: expiresAt,
+      });
 
     if (error) {
       log.error('[ProofPix] token insert failed:', error.message);
       return res.status(500).json(errBody('INTERNAL', 'Failed to issue token.'));
     }
 
-    log.log(`[ProofPix] issued connect token for user ${userId}`);
+    log.log(`[ProofPix] issued connect token for user ${userId} tm=${forTM.teamMemberId ?? '-'}`);
     return res.status(200).json({
       token,
       expires_in: Math.floor(CONNECT_TOKEN_TTL_MS / 1000),
     });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // GET /connect/token/status?token=<token>
+  //   Token-scoped polling endpoint for the SF web authorize page.
+  //   The token itself is the capability — knowing it already unlocks
+  //   redemption via /connect/redeem, so exposing status is strictly
+  //   less powerful than what the caller already has.
+  //
+  //   Response: { status: 'pending' | 'redeemed' | 'expired' | 'unknown' }
+  //
+  //   'unknown' collapses both "malformed shape" and "not in DB" so a
+  //   token-enumerator can't distinguish "never existed" from "expired
+  //   long ago" (matches the OAuth device-flow convention).
+  //
+  //   Rate limit is looser than the credential-exchange limiter (30/min
+  //   vs 5/min) because the desktop polls this every ~4s. Still tight
+  //   enough that a wide sweep is expensive.
+  // ═════════════════════════════════════════════════════════════════
+  const statusPollLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: errBody(
+      'RATE_LIMITED',
+      'Too many status polls.',
+      { retryable: true, retryAfterSeconds: 60 }
+    ),
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+
+  router.get('/connect/token/status', statusPollLimiter, async (req, res) => {
+    const token = req.query.token;
+    if (!isConnectToken(token)) {
+      return res.status(200).json({ status: 'unknown' });
+    }
+    const { data: row, error } = await supabase
+      .from('proofpix_connect_codes')
+      .select('code, redeemed_at, expires_at')
+      .eq('code', token)
+      .maybeSingle();
+    if (error) {
+      log.error('[ProofPix] token status lookup failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Status lookup failed.'));
+    }
+    if (!row) {
+      return res.status(200).json({ status: 'unknown' });
+    }
+    if (row.redeemed_at) {
+      return res.status(200).json({ status: 'redeemed' });
+    }
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      return res.status(200).json({ status: 'expired' });
+    }
+    return res.status(200).json({ status: 'pending' });
   });
 
   // ═════════════════════════════════════════════════════════════════
@@ -267,9 +403,41 @@ module.exports = (supabase, logger) => {
   // POST /connect/code/redeem (kept ≥30 days for the existing
   // ProofPix-native adapter; same handler, no behavior diff).
   // ═════════════════════════════════════════════════════════════════
+  // Trim + hard-cap a display-only string. Length cap matches the
+  // existing device_label sanitizer so all display fields land in the
+  // DB with the same guarantees.
+  function sanitizeDisplayField(value, maxLen = 200) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    return trimmed.slice(0, maxLen);
+  }
+
   async function handleRedeem(req, res) {
     const input = req.body && req.body.code;
     const deviceLabel = req.body && req.body.device_label;
+    // Optional device metadata — ProofPix mobile client may include
+    // these to populate the SF /settings/proofpix devices card. All
+    // NULL-safe: if the mobile client hasn't been updated yet, the row
+    // is still valid, just less descriptive.
+    const deviceModel = sanitizeDisplayField(req.body && req.body.device_model);
+    const osName     = sanitizeDisplayField(req.body && req.body.os_name, 40);
+    const osVersion  = sanitizeDisplayField(req.body && req.body.os_version, 40);
+    const role       = sanitizeDisplayField(req.body && req.body.role, 40);
+
+    // Identity of the ProofPix user completing the pair — added in the
+    // OTA after cbb4bd1. Coverage per role:
+    //   admin/individual → all three present
+    //   team_member      → id + name present; email is NULL by design
+    //                      (team members have no email locally)
+    // Legacy clients omit these entirely — nulls all the way, harmless.
+    const pairedByProofpixUserId = sanitizeDisplayField(req.body && req.body.paired_by_proofpix_user_id, 64);
+    const pairedByName           = sanitizeDisplayField(req.body && req.body.paired_by_name, 200);
+    const pairedByEmail          = sanitizeDisplayField(req.body && req.body.paired_by_email, 200);
+    // req.ip is trust-proxy-safe (server.js:691 sets 'trust proxy', 1).
+    // Truncate to 64 chars to match the pattern in lib/admin-auth.js.
+    const clientIp = ((req.ip || req.headers['x-forwarded-for'] || '') + '').slice(0, 64) || null;
+
     if (typeof input !== 'string' || !input.trim()) {
       return res.status(400).json(errBody('INVALID_PAYLOAD', 'Missing or malformed code.'));
     }
@@ -290,7 +458,7 @@ module.exports = (supabase, logger) => {
 
     const { data: row, error } = await supabase
       .from('proofpix_connect_codes')
-      .select('code, user_id, expires_at, redeemed_at')
+      .select('code, user_id, linked_sf_team_member_id, expires_at, redeemed_at')
       .eq('code', lookupKey)
       .maybeSingle();
 
@@ -343,8 +511,21 @@ module.exports = (supabase, logger) => {
       .from('proofpix_connections')
       .insert({
         user_id: row.user_id,
+        // Scope the resulting device to a specific SF team member if
+        // the admin selected one at issue time. Copied verbatim from
+        // the code row — /jobs uses this to filter downstream.
+        linked_sf_team_member_id: row.linked_sf_team_member_id,
         refresh_token_hash: refreshHash,
         device_label: labelToStore,
+        device_model: deviceModel,
+        os_name: osName,
+        os_version: osVersion,
+        role: role,
+        paired_by_proofpix_user_id: pairedByProofpixUserId,
+        paired_by_name: pairedByName,
+        paired_by_email: pairedByEmail,
+        paired_from_ip: clientIp,
+        last_seen_ip: clientIp,
       })
       .select('id')
       .single();
@@ -413,17 +594,230 @@ module.exports = (supabase, logger) => {
       connectionId: conn.id,
     });
 
-    // Best-effort timestamp bump — failure to bump shouldn't fail the
-    // refresh, since the token itself is still valid.
+    // Best-effort timestamp + IP bump — failure to bump shouldn't fail
+    // the refresh, since the token itself is still valid. IP is
+    // captured server-side (trust-proxy honored via server.js:691), so
+    // even devices whose mobile client never sent metadata at
+    // /connect/redeem will accumulate a last_seen_ip after their first
+    // refresh call.
+    const refreshIp = ((req.ip || req.headers['x-forwarded-for'] || '') + '').slice(0, 64) || null;
     supabase
       .from('proofpix_connections')
-      .update({ last_used_at: new Date().toISOString() })
+      .update({
+        last_used_at: new Date().toISOString(),
+        last_seen_ip: refreshIp,
+      })
       .eq('id', conn.id)
       .then(({ error: e }) => { if (e) log.warn('[ProofPix] last_used_at bump failed:', e.message); });
 
     return res.status(200).json({
       access_token: accessToken,
       expires_in: ACCESS_TOKEN_TTL_SEC,
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // GET /connections
+  //   SF-side list of the calling user's active ProofPix devices.
+  //   Used by /settings/proofpix to render "these devices are paired"
+  //   so the admin gets a visible confirmation after the QR flow
+  //   redirects them back. Distinct from /connection/status (below)
+  //   which is scoped to a single device via its access token.
+  //
+  //   Auth: SF user JWT — mirrors the same envelope as
+  //   /connect/token/issue, so the settings page can reuse the
+  //   Authorization: Bearer <sfJwt> header it already carries.
+  //
+  //   Revoked rows are filtered out (the partial index
+  //   idx_proofpix_connections_user_active covers this exact query).
+  //   Refresh token hash is never returned — only the audit fields.
+  // ═════════════════════════════════════════════════════════════════
+  router.get('/connections', requireSfUserJwt, async (req, res) => {
+    const { data, error } = await supabase
+      .from('proofpix_connections')
+      .select('id, device_label, device_model, os_name, os_version, role, paired_by_proofpix_user_id, paired_by_name, paired_by_email, paired_from_ip, last_seen_ip, linked_sf_team_member_id, created_at, last_used_at')
+      .eq('user_id', req.sfUserId)
+      .is('revoked_at', null)
+      .order('created_at', { ascending: false });
+    if (error) {
+      log.error('[ProofPix] connections list failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Connection list failed.'));
+    }
+    const rows = data || [];
+
+    // Batch-fetch team_member display fields for any linked rows so
+    // the settings UI can render "Linked to Sarah T." without an
+    // extra roundtrip per device. Two-step (not a PostgREST embed)
+    // keeps the fake-supabase in tests trivial to extend.
+    const linkedIds = Array.from(
+      new Set(rows.map((r) => r.linked_sf_team_member_id).filter((v) => v != null))
+    );
+    const linkedMap = new Map();
+    if (linkedIds.length > 0) {
+      const { data: memberRows, error: memberErr } = await supabase
+        .from('team_members')
+        .select('id, first_name, last_name, email, role')
+        .in('id', linkedIds);
+      if (memberErr) {
+        // Non-fatal — linked_sf_team_member returns null instead of
+        // {…}. Client already handles null gracefully (falls back to
+        // no chip). Better to render the list than 500.
+        log.warn('[ProofPix] team_members join failed:', memberErr.message);
+      } else {
+        (memberRows || []).forEach((m) => {
+          linkedMap.set(m.id, {
+            id: m.id,
+            first_name: m.first_name,
+            last_name: m.last_name,
+            email: m.email,
+            role: m.role,
+          });
+        });
+      }
+    }
+
+    return res.status(200).json({
+      connections: rows.map((r) => ({
+        id: r.id,
+        device_label: r.device_label,
+        device_model: r.device_model,
+        os_name: r.os_name,
+        os_version: r.os_version,
+        role: r.role,
+        paired_by_proofpix_user_id: r.paired_by_proofpix_user_id,
+        paired_by_name: r.paired_by_name,
+        paired_by_email: r.paired_by_email,
+        paired_from_ip: r.paired_from_ip,
+        last_seen_ip: r.last_seen_ip,
+        linked_sf_team_member_id: r.linked_sf_team_member_id,
+        linked_sf_team_member: r.linked_sf_team_member_id != null
+          ? (linkedMap.get(r.linked_sf_team_member_id) || null)
+          : null,
+        created_at: r.created_at,
+        last_used_at: r.last_used_at,
+      })),
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // DELETE /connections/:id
+  //   SF-side admin revoke — lets the SF /settings/proofpix page
+  //   disconnect a specific device. Distinct from DELETE /connection
+  //   (below) which is scoped to the calling device via its OWN
+  //   access token; this one is authed by the SF user JWT and takes
+  //   the connection id in the path so the admin can revoke any of
+  //   their own devices from the web UI.
+  //
+  //   Ownership: the WHERE clause pins user_id to the calling JWT so
+  //   even if an admin crafts a request with someone else's id, we
+  //   won't touch it. Response distinguishes:
+  //     - 204: revoked (or already revoked — idempotent)
+  //     - 400: :id isn't a valid number
+  //     - 404: no such connection under the calling user (either
+  //            wrong id, or belongs to someone else — collapsed to
+  //            not-found so we don't leak existence of foreign rows)
+  // ═════════════════════════════════════════════════════════════════
+  router.delete('/connections/:id', requireSfUserJwt, async (req, res) => {
+    const rawId = req.params.id;
+    const connectionId = Number.parseInt(rawId, 10);
+    if (!Number.isFinite(connectionId) || connectionId <= 0 || String(connectionId) !== rawId) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Malformed connection id.'));
+    }
+
+    // Existence + ownership check BEFORE the update so we can return
+    // 404 for rows that don't belong to the caller. Idempotent
+    // revoke-of-already-revoked returns 204 (matches the existing
+    // DELETE /connection semantics), so we intentionally don't filter
+    // on revoked_at here.
+    const { data: existing, error: lookupErr } = await supabase
+      .from('proofpix_connections')
+      .select('id, revoked_at')
+      .eq('id', connectionId)
+      .eq('user_id', req.sfUserId)
+      .maybeSingle();
+    if (lookupErr) {
+      log.error('[ProofPix] connections revoke lookup failed:', lookupErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Revoke lookup failed.'));
+    }
+    if (!existing) {
+      return res.status(404).json(errBody('NOT_FOUND', 'Connection not found.'));
+    }
+    if (existing.revoked_at) {
+      // Already revoked — idempotent success.
+      return res.status(204).end();
+    }
+
+    const { error: updateErr } = await supabase
+      .from('proofpix_connections')
+      .update({ revoked_at: new Date().toISOString() })
+      .eq('id', connectionId)
+      .eq('user_id', req.sfUserId)
+      .is('revoked_at', null);
+    if (updateErr) {
+      log.error('[ProofPix] connections revoke failed:', updateErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Revoke failed.'));
+    }
+    log.log(`[ProofPix] admin revoked conn ${connectionId} for user ${req.sfUserId}`);
+    return res.status(204).end();
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // GET /settings
+  //   Per-workspace ProofPix integration settings. Currently exposes
+  //   one toggle:
+  //     show_recurring_jobs — whether the /jobs endpoint surfaces
+  //     jobs.is_recurring=true to any ProofPix caller (team members
+  //     + admin's own device). Default false so recurring cleanings
+  //     stay off the team's phones until the admin opts in.
+  //
+  //   Auth: SF user JWT (same as /connections). Read-scoped to the
+  //   calling admin's own users row.
+  // ═════════════════════════════════════════════════════════════════
+  router.get('/settings', requireSfUserJwt, async (req, res) => {
+    const { data, error } = await supabase
+      .from('users')
+      .select('proofpix_show_recurring_jobs')
+      .eq('id', req.sfUserId)
+      .single();
+    if (error) {
+      log.error('[ProofPix] /settings read failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Settings read failed.'));
+    }
+    return res.status(200).json({
+      show_recurring_jobs: !!(data && data.proofpix_show_recurring_jobs),
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // PATCH /settings
+  //   Update the ProofPix integration settings for the caller's
+  //   workspace. Currently accepts { show_recurring_jobs: boolean }.
+  //   Rejects unknown keys / non-boolean values with 400 — never
+  //   coerces, so a client-side bug can't accidentally toggle the
+  //   flag on/off without an explicit boolean.
+  //
+  //   Auth: SF user JWT. Write-scoped to the calling admin's own
+  //   users row (WHERE id = req.sfUserId).
+  // ═════════════════════════════════════════════════════════════════
+  router.patch('/settings', requireSfUserJwt, async (req, res) => {
+    const body = req.body || {};
+    if (typeof body.show_recurring_jobs !== 'boolean') {
+      return res.status(400).json(errBody(
+        'INVALID_PAYLOAD',
+        'show_recurring_jobs must be a boolean.'
+      ));
+    }
+    const { error } = await supabase
+      .from('users')
+      .update({ proofpix_show_recurring_jobs: body.show_recurring_jobs })
+      .eq('id', req.sfUserId);
+    if (error) {
+      log.error('[ProofPix] /settings write failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Settings write failed.'));
+    }
+    log.log(`[ProofPix] user ${req.sfUserId} set show_recurring_jobs=${body.show_recurring_jobs}`);
+    return res.status(200).json({
+      show_recurring_jobs: body.show_recurring_jobs,
     });
   });
 
@@ -441,6 +835,43 @@ module.exports = (supabase, logger) => {
       valid: true,
       workspace_id: workspace.workspace_id,
       workspace_name: workspace.workspace_name,
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // GET /sf-team-members
+  //   Lists the SF workspace's own team members (from the SF-native
+  //   team_members table — NOT the ProofPix shadow proofpix_team_members).
+  //   Used by ProofPix admin's invite flow to pick which SF cleaner
+  //   an outgoing invite maps to, so the invite carries an
+  //   sf_team_member_id from birth and downstream /jobs?team_member_id=
+  //   routing works without a separate link step.
+  //
+  //   Auth: ProofPix access token — same envelope as /jobs. Scoped
+  //   to req.proofpix.userId (the workspace owner). Active members
+  //   only. No pagination — workspaces are ≤ tens of members.
+  // ═════════════════════════════════════════════════════════════════
+  router.get('/sf-team-members', requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+    const { data, error } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, email, role, status')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('first_name', { ascending: true });
+    if (error) {
+      log.error('[ProofPix] /sf-team-members lookup failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Team member lookup failed.'));
+    }
+    return res.status(200).json({
+      team_members: (data || []).map((m) => ({
+        id: m.id,
+        first_name: m.first_name,
+        last_name: m.last_name,
+        email: m.email,
+        role: m.role,
+        status: m.status,
+      })),
     });
   });
 
@@ -504,14 +935,30 @@ module.exports = (supabase, logger) => {
 
   function scheduledAtMs(j) {
     if (!j.scheduled_date) return null;
-    // scheduled_date is `text NOT NULL` in the schema, but the live data
-    // is mixed — some rows are 'YYYY-MM-DD' and others 'YYYY-MM-DD HH:MM:SS'
-    // (ZB sync historically wrote the latter). Take the date prefix and
-    // re-attach scheduled_time so we always get an unambiguous local
-    // timestamp string Date.parse can handle.
-    const dateOnly = String(j.scheduled_date).slice(0, 10);
+    // scheduled_date is `text NOT NULL` in the schema; live data is
+    // mixed — some rows are bare 'YYYY-MM-DD', others are
+    // 'YYYY-MM-DD HH:MM:SS' (ZB sync historically wrote the latter,
+    // and it's now the dominant shape for scheduled workflow).
+    // scheduled_time exists as a separate column but on production
+    // rows it's often a default filler ('09:00:00') that does NOT
+    // reflect the real appointment time — that lives embedded in
+    // scheduled_date.
+    //
+    // Rule: if scheduled_date carries an embedded time, use it
+    // verbatim. ONLY fall back to scheduled_time when the date is
+    // bare (no time component). This matches what SF web displays.
+    const raw = String(j.scheduled_date).trim();
+    const dateOnly = raw.slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateOnly)) return null;
-    const time = j.scheduled_time || '09:00:00';
+    const hasEmbeddedTime = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?/.test(raw);
+    let time;
+    if (hasEmbeddedTime) {
+      // Extract HH:MM[:SS] after the date part, normalize the separator.
+      const timePart = raw.slice(11).split(/[+.Z ]/)[0];
+      time = /^\d{2}:\d{2}$/.test(timePart) ? `${timePart}:00` : timePart;
+    } else {
+      time = j.scheduled_time || '09:00:00';
+    }
     const ms = Date.parse(`${dateOnly}T${time}`);
     return Number.isFinite(ms) ? ms : null;
   }
@@ -538,12 +985,49 @@ module.exports = (supabase, logger) => {
 
   router.get('/jobs', requireProofpixAccessToken, async (req, res) => {
     const userId = req.proofpix.userId;
+    const linkedTeamMemberId = req.proofpix.linkedSfTeamMemberId;
+
+    // Per-request team-member scope: proxy pattern where a single
+    // admin-scoped connection serves multiple team members by passing
+    // ?team_member_id=<id> on each /jobs call. Distinct from
+    // linked_sf_team_member_id (which pins the entire connection at
+    // pair time). See the SF ↔ ProofPix follow-up thread — this is
+    // Option B for per-cleaner routing without re-pairing.
+    //
+    // Precedence + safety:
+    //   • Must belong to the caller's workspace (resolveForTeamMemberId
+    //     re-validates against team_members.user_id).
+    //   • If the connection is ALREADY scoped (linkedSfTeamMemberId
+    //     set), the request param must match — otherwise the scoped
+    //     pair's invariant would be violated. Mismatch → 403.
+    //   • If the connection is admin-scope, the query param wins.
+    let requestTeamMemberIdRaw = req.query.team_member_id;
+    if (Array.isArray(requestTeamMemberIdRaw)) requestTeamMemberIdRaw = requestTeamMemberIdRaw[0];
+    let effectiveTeamMemberId = linkedTeamMemberId;
+    if (requestTeamMemberIdRaw != null && requestTeamMemberIdRaw !== '') {
+      const forTM = await resolveForTeamMemberId(requestTeamMemberIdRaw, userId);
+      if (!forTM.ok) {
+        return res.status(forTM.status).json(errBody(forTM.code, forTM.message));
+      }
+      if (linkedTeamMemberId != null && linkedTeamMemberId !== forTM.teamMemberId) {
+        return res.status(403).json(errBody(
+          'FORBIDDEN',
+          'Connection is pinned to a different team member; drop the ?team_member_id query param or re-pair.'
+        ));
+      }
+      effectiveTeamMemberId = forTM.teamMemberId;
+    }
 
     // ── Parse + validate query params ───────────────────────────────
     const statusParam = (typeof req.query.status === 'string' && req.query.status)
       ? req.query.status
       : 'active';
-    if (!['active', 'all', 'completed', 'cancelled', 'scheduled'].includes(statusParam)) {
+    // 'open' = active ∪ scheduled — the "everything not done" bucket
+    // that matches SF web's default job list (which shows scheduled
+    // jobs alongside active work). Without this, /jobs?status=active
+    // undercounts vs the SF web view whenever the workspace has
+    // scheduled-but-not-yet-active jobs.
+    if (!['active', 'all', 'completed', 'cancelled', 'scheduled', 'open'].includes(statusParam)) {
       return res.status(400).json(errBody('INVALID_PAYLOAD', 'Unknown status filter.'));
     }
 
@@ -582,12 +1066,37 @@ module.exports = (supabase, logger) => {
       searchCustomerIds = (matched || []).map((c) => c.id);
     }
 
+    // ── Team-member scope: if this call is targeting a specific SF
+    //    team member (via the pair's linked_sf_team_member_id OR the
+    //    per-request ?team_member_id override — precedence resolved
+    //    above into effectiveTeamMemberId), only return jobs
+    //    assigned to them. SF stores assignments in TWO places (see
+    //    server.js:3079-3106): jobs.team_member_id (legacy single-
+    //    assignee column) AND job_team_assignments (newer multi-
+    //    assignee join). Union of both = full picture.
+    //
+    //    Pull the assignment-table ids upfront so the final /jobs query
+    //    stays a single filter chain (composes cleanly with search + cursor).
+    let assignedJobIds = null;
+    if (effectiveTeamMemberId != null) {
+      const { data: assignments, error: assignErr } = await supabase
+        .from('job_team_assignments')
+        .select('job_id')
+        .eq('team_member_id', effectiveTeamMemberId);
+      if (assignErr) {
+        log.error('[ProofPix] /jobs assignments lookup failed:', assignErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Assignment lookup failed.'));
+      }
+      assignedJobIds = Array.from(new Set((assignments || []).map((a) => Number(a.job_id)))).filter(Number.isFinite);
+    }
+
     // ── Build the jobs query ────────────────────────────────────────
     let query = supabase
       .from('jobs')
       .select(`
         id, status, service_name,
         scheduled_date, scheduled_time, created_at,
+        team_member_id, customer_id,
         service_address_street, service_address_city,
         service_address_state, service_address_zip,
         customers!left ( first_name, last_name )
@@ -597,9 +1106,24 @@ module.exports = (supabase, logger) => {
       .order('id', { ascending: false })
       .limit(limit + 1);   // +1 = peek for next page
 
+    // Team-member scope filter — OR'd from two sources.
+    if (effectiveTeamMemberId != null) {
+      const scopeOrs = [`team_member_id.eq.${effectiveTeamMemberId}`];
+      if (assignedJobIds && assignedJobIds.length > 0) {
+        scopeOrs.push(`id.in.(${assignedJobIds.join(',')})`);
+      }
+      // Each .or() is its own AND'd group in PostgREST — the search
+      // .or() below stays independent, so both filters compose as
+      // (scope) AND (search).
+      query = query.or(scopeOrs.join(','));
+    }
+
     // Status filter
     if (statusParam === 'active') {
       query = query.in('status', ACTIVE_SF_STATUSES);
+    } else if (statusParam === 'open') {
+      // active ∪ scheduled — the "everything not done" SF-web default.
+      query = query.in('status', [...ACTIVE_SF_STATUSES, 'scheduled']);
     } else if (statusParam === 'completed') {
       query = query.in('status', ['completed', 'complete', 'paid']);
     } else if (statusParam === 'cancelled') {
@@ -608,6 +1132,32 @@ module.exports = (supabase, logger) => {
       query = query.eq('status', 'scheduled');
     }
     // 'all' → no filter.
+
+    // Recurring-job visibility filter. Workspace default (see migration
+    // 079) is to hide jobs.is_recurring=true from ProofPix entirely —
+    // team members only see one-time / first-clean projects. Admin
+    // opts in via PATCH /settings. Applies uniformly to every /jobs
+    // caller (team_member scope, admin scope, per-request team_member_id
+    // proxy) — the deliberate rule is "admin sees what team members
+    // see" so the admin can preview visibility from their own device.
+    //
+    // Include NULL rows (legacy pre-flag data) as non-recurring so we
+    // don't accidentally hide historical work.
+    const { data: workspaceSettings, error: settingsErr } = await supabase
+      .from('users')
+      .select('proofpix_show_recurring_jobs')
+      .eq('id', userId)
+      .single();
+    if (settingsErr) {
+      log.warn('[ProofPix] /jobs settings lookup failed:', settingsErr.message);
+      // Non-fatal — fail closed (hide recurring) to match the default
+      // rather than accidentally leaking recurring jobs on a transient
+      // DB read error.
+    }
+    const showRecurring = !!(workspaceSettings && workspaceSettings.proofpix_show_recurring_jobs);
+    if (!showRecurring) {
+      query = query.or('is_recurring.is.null,is_recurring.eq.false');
+    }
 
     // Search filter
     if (search) {
@@ -646,9 +1196,43 @@ module.exports = (supabase, logger) => {
     const hasMore  = (rows || []).length > limit;
     const nextCursor = hasMore ? encodeCursor(pageRows[pageRows.length - 1]) : null;
 
+    // ── Multi-assignee lookup for the page: batch-fetch every
+    //    job_team_assignments row whose job_id is on this page. Used
+    //    to populate the per-job team_member_ids[] response field so
+    //    the ProofPix admin's Team Projects tab can filter client-
+    //    side without extra roundtrips. Distinct from the earlier
+    //    assignments query (line ~985) which pulled ids for a SINGLE
+    //    team member to build the scope filter — this one pulls all
+    //    assignees for the returned page's jobs.
+    const jobIds = pageRows.map((r) => r.id);
+    const teamMemberIdsByJobId = new Map();
+    if (jobIds.length > 0) {
+      const { data: assignRows, error: assignErr } = await supabase
+        .from('job_team_assignments')
+        .select('job_id, team_member_id')
+        .in('job_id', jobIds);
+      if (assignErr) {
+        // Non-fatal — team_member_ids becomes [] for every row.
+        // ProofPix's Team Projects filter degrades to "primary
+        // assignee only" (jobs.team_member_id, still returned).
+        log.warn('[ProofPix] /jobs assignments batch lookup failed:', assignErr.message);
+      } else {
+        for (const row of assignRows || []) {
+          const jid = Number(row.job_id);
+          const tmid = Number(row.team_member_id);
+          if (!Number.isFinite(jid) || !Number.isFinite(tmid)) continue;
+          const list = teamMemberIdsByJobId.get(jid);
+          if (list) {
+            if (!list.includes(tmid)) list.push(tmid);
+          } else {
+            teamMemberIdsByJobId.set(jid, [tmid]);
+          }
+        }
+      }
+    }
+
     // ── Photo counts via the SQL helper (single round-trip, dodges
     //    1000-row default limit on customer_files.) ────────────────
-    const jobIds = pageRows.map((r) => r.id);
     const countsByJobId = {};
     if (jobIds.length > 0) {
       const { data: counts, error: countErr } = await supabase
@@ -665,18 +1249,92 @@ module.exports = (supabase, logger) => {
       }
     }
 
+    // ── First-job flags via a single RPC (see migration 077). For each
+    //    (workspace, customer) on this page, the RPC returns the
+    //    earliest non-cancelled (scheduled_date, id). A page row is the
+    //    customer's first real job iff its own status != 'cancelled'
+    //    AND (scheduled_date, id) matches the earliest for its customer.
+    //
+    //    Cancelled jobs never consume the "first" slot: if the
+    //    customer's earliest booking was cancelled, the next non-
+    //    cancelled job becomes first. This matches ProofPix's
+    //    "New customers only" auto-create semantics.
+    //
+    //    Batched — one RPC per page regardless of customer count.
+    //    Non-fatal: on failure, is_first_job_for_customer is null for
+    //    every row and the mobile client's "new_customers" policy
+    //    fails safely (no auto-create instead of guessing).
+    const pageCustomerIds = [
+      ...new Set(pageRows.map((r) => r.customer_id).filter((c) => Number.isFinite(c))),
+    ];
+    const earliestByCustomer = new Map();
+    if (pageCustomerIds.length > 0) {
+      const { data: firstRows, error: firstErr } = await supabase
+        .rpc('proofpix_customer_first_job', {
+          p_user_id: userId,
+          p_customer_ids: pageCustomerIds,
+        });
+      if (firstErr) {
+        log.warn('[ProofPix] proofpix_customer_first_job rpc failed:', firstErr.message);
+      } else {
+        for (const row of firstRows || []) {
+          if (row?.customer_id == null) continue;
+          earliestByCustomer.set(Number(row.customer_id), {
+            d: row.scheduled_date,
+            i: Number(row.job_id),
+          });
+        }
+      }
+    }
+
     // ── Shape response ──────────────────────────────────────────────
-    const jobs = pageRows.map((j) => ({
-      id: String(j.id),
-      title: j.service_name && String(j.service_name).trim()
-        ? String(j.service_name).trim()
-        : `Job #${j.id}`,
-      customer_name: customerName(j.customers),
-      address: joinAddress(j),
-      status: bucketStatus(j.status),
-      scheduled_at: scheduledAtMs(j),
-      photo_count: countsByJobId[j.id] || 0,
-    }));
+    const jobs = pageRows.map((j) => {
+      const custId = j.customer_id != null ? Number(j.customer_id) : null;
+      const earliest = custId != null ? earliestByCustomer.get(custId) : null;
+      // Only mark first when we actually got RPC data back — a null
+      // means the helper failed and the mobile client must not guess.
+      // The RPC always returns a row for every non-empty customer_id
+      // with at least one non-cancelled job, so a missing entry when
+      // the RPC succeeded means "customer has zero non-cancelled jobs"
+      // (impossible while THIS job is non-cancelled), which we treat
+      // conservatively as null.
+      let isFirst = null;
+      if (custId != null && pageCustomerIds.length > 0) {
+        if (j.status === 'cancelled') {
+          isFirst = false;
+        } else if (earliest) {
+          isFirst = earliest.d === j.scheduled_date && earliest.i === Number(j.id);
+        }
+      }
+      return {
+        id: String(j.id),
+        title: j.service_name && String(j.service_name).trim()
+          ? String(j.service_name).trim()
+          : `Job #${j.id}`,
+        customer_name: customerName(j.customers),
+        // Stable SF customer identifier — exposed so ProofPix can key
+        // its "New customers only" logic on an authoritative id
+        // instead of the display name (which can collide / rename).
+        // Null when the job has no customer linkage (rare).
+        customer_id: custId,
+        // Set-based first-job flag; see migration 077 for the rule.
+        // null when the RPC failed OR when this job has no customer_id
+        // — mobile client's "new_customers" policy treats null as
+        // "unknown, do not auto-create" (fail-safe).
+        is_first_job_for_customer: isFirst,
+        address: joinAddress(j),
+        status: bucketStatus(j.status),
+        scheduled_at: scheduledAtMs(j),
+        photo_count: countsByJobId[j.id] || 0,
+        // Primary assignee — jobs.team_member_id (legacy single-
+        // assignee column). Null when unassigned. Distinct from
+        // team_member_ids below, which is the multi-assignee join.
+        team_member_id: j.team_member_id != null ? Number(j.team_member_id) : null,
+        // All assignees via job_team_assignments (may be empty even
+        // when team_member_id is set — the two aren't synced).
+        team_member_ids: teamMemberIdsByJobId.get(Number(j.id)) || [],
+      };
+    });
 
     return res.status(200).json({ jobs, next_cursor: nextCursor });
   });
@@ -904,6 +1562,47 @@ module.exports = (supabase, logger) => {
       }
 
       log.log(`[ProofPix] photo attached: user=${userId} job=${jobId} photo_id=${insertRes.data.id}`);
+
+      // Team-member activity bump — if the upload metadata carries a
+      // captured_by string and it exact-matches a joined team member's
+      // display_name for this workspace, bump their last_upload_at /
+      // last_seen_at / photo_count. Missing match is silent (per doc
+      // §3: "do NOT auto-create a row — that path stays reserved for
+      // POST /team-members"). Best-effort — a failure here doesn't
+      // block the upload success response.
+      const capturedBy = meta.metadata && typeof meta.metadata.captured_by === 'string'
+        ? meta.metadata.captured_by.trim()
+        : '';
+      if (capturedBy) {
+        supabase
+          .from('proofpix_team_members')
+          .select('id, photo_count')
+          .eq('user_id', userId)
+          .eq('display_name', capturedBy)
+          .eq('status', 'joined')
+          .maybeSingle()
+          .then(({ data: member, error: lookupErr }) => {
+            if (lookupErr) {
+              log.warn('[ProofPix] team-member activity lookup failed:', lookupErr.message);
+              return;
+            }
+            if (!member) return;   // no match, silent per spec
+            const nowIso = new Date().toISOString();
+            supabase
+              .from('proofpix_team_members')
+              .update({
+                last_upload_at: nowIso,
+                last_seen_at: nowIso,
+                photo_count: Number(member.photo_count || 0) + 1,
+                updated_at: nowIso,
+              })
+              .eq('id', member.id)
+              .then(({ error: updErr }) => {
+                if (updErr) log.warn('[ProofPix] team-member activity bump failed:', updErr.message);
+              });
+          });
+      }
+
       return res.status(200).json({
         success: true,
         crm_photo_id: String(insertRes.data.id),
@@ -912,5 +1611,259 @@ module.exports = (supabase, logger) => {
     }
   );
 
+  // ═════════════════════════════════════════════════════════════════
+  // Team-member visibility endpoints — see
+  //   docs SERVICE_FLOW_TEAM_MEMBERS_TASK.md (ProofPix side).
+  //
+  // SF-side shadow of the ProofPix admin's own ProofPix team. Prior
+  // to this, SF only knew the admin (via proofpix_connections) and
+  // had to wait for a photo upload with metadata.captured_by before
+  // it could infer other crew existence. These endpoints let the
+  // ProofPix proxy push a row on join, list them from SF, and revoke.
+  //
+  // All authed by ProofPix access token — the proxy calls with the
+  // admin's token (obtained via /connect/refresh from the admin's
+  // stored refresh token), so req.proofpix.userId = the admin's
+  // users.id = workspace_id. Cross-tenant leak impossible.
+  // ═════════════════════════════════════════════════════════════════
+
+  // 30/min per workspace (keyed on req.proofpix.userId so all admin
+  // access tokens through the same proxy IP still share correctly).
+  // 6× the doc's suggested 100/h cap — comfortable for bursty joins,
+  // still tight enough to make abuse expensive.
+  const teamMembersLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: errBody(
+      'RATE_LIMITED',
+      'Too many team-member calls.',
+      { retryable: true, retryAfterSeconds: 60 }
+    ),
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => (req.proofpix && String(req.proofpix.userId)) || req.ip,
+  });
+
+  function encodeTeamMembersCursor(id) {
+    return Buffer.from(JSON.stringify({ i: id })).toString('base64url');
+  }
+  function decodeTeamMembersCursor(input) {
+    if (!input) return null;
+    try {
+      const parsed = JSON.parse(Buffer.from(String(input), 'base64url').toString('utf8'));
+      if (!Number.isFinite(Number(parsed.i))) return null;
+      return Number(parsed.i);
+    } catch {
+      return null;
+    }
+  }
+
+  // POST /team-members
+  //   Upsert on (user_id, proofpix_member_token). Rejoin-after-revoke
+  //   flips status back to 'joined', clears revoked_at, resets
+  //   joined_at (per doc §3).
+  router.post('/team-members', teamMembersLimiter, requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+    const token = sanitizeDisplayField(req.body && req.body.proofpix_member_token, 128);
+    if (!token) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'proofpix_member_token is required.'));
+    }
+    const displayName = sanitizeDisplayField(req.body && req.body.display_name, 200);
+    const email       = sanitizeDisplayField(req.body && req.body.email, 200);
+    const deviceModel = sanitizeDisplayField(req.body && req.body.device_model, 200);
+    const osName      = sanitizeDisplayField(req.body && req.body.os_name, 40);
+    const osVersion   = sanitizeDisplayField(req.body && req.body.os_version, 40);
+
+    const { data: existing, error: lookupErr } = await supabase
+      .from('proofpix_team_members')
+      .select('id, status, joined_at')
+      .eq('user_id', userId)
+      .eq('proofpix_member_token', token)
+      .maybeSingle();
+    if (lookupErr) {
+      log.error('[ProofPix] team-members lookup failed:', lookupErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Team-member lookup failed.'));
+    }
+
+    const now = new Date().toISOString();
+
+    if (existing) {
+      const wasRevoked = existing.status === 'revoked';
+      const patch = {
+        display_name: displayName,
+        email: email,
+        device_model: deviceModel,
+        os_name: osName,
+        os_version: osVersion,
+        last_seen_at: now,
+        updated_at: now,
+      };
+      if (wasRevoked) {
+        patch.status = 'joined';
+        patch.revoked_at = null;
+        patch.joined_at = now;
+      }
+      const { error: updErr } = await supabase
+        .from('proofpix_team_members')
+        .update(patch)
+        .eq('id', existing.id);
+      if (updErr) {
+        log.error('[ProofPix] team-members update failed:', updErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Team-member update failed.'));
+      }
+      return res.status(200).json({
+        id: existing.id,
+        workspace_id: String(userId),
+        proofpix_member_token: token,
+        status: 'joined',
+        joined_at: wasRevoked ? now : existing.joined_at,
+      });
+    }
+
+    const { data: inserted, error: insErr } = await supabase
+      .from('proofpix_team_members')
+      .insert({
+        user_id: userId,
+        proofpix_member_token: token,
+        display_name: displayName,
+        email: email,
+        device_model: deviceModel,
+        os_name: osName,
+        os_version: osVersion,
+        status: 'joined',
+        joined_at: now,
+        last_seen_at: now,
+      })
+      .select('id, joined_at')
+      .single();
+    if (insErr || !inserted) {
+      log.error('[ProofPix] team-members insert failed:', insErr && insErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Team-member create failed.'));
+    }
+    log.log(`[ProofPix] team-member joined workspace=${userId} name=${displayName ?? '-'}`);
+    return res.status(200).json({
+      id: inserted.id,
+      workspace_id: String(userId),
+      proofpix_member_token: token,
+      status: 'joined',
+      joined_at: inserted.joined_at,
+    });
+  });
+
+  // GET /team-members?status=&limit=&cursor=
+  //   Cursor-paginated (opaque base64url id descending). Default
+  //   status='joined'; 'revoked' and 'all' also supported.
+  router.get('/team-members', teamMembersLimiter, requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+    const statusParam = typeof req.query.status === 'string' ? req.query.status : 'joined';
+    if (!['joined', 'revoked', 'all'].includes(statusParam)) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Unknown status filter.'));
+    }
+    const requestedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 500)
+      : 100;
+    const cursor = decodeTeamMembersCursor(req.query.cursor);
+    if (req.query.cursor && !cursor) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Malformed cursor.'));
+    }
+
+    let query = supabase
+      .from('proofpix_team_members')
+      .select('id, proofpix_member_token, display_name, email, device_model, os_name, os_version, status, joined_at, last_seen_at, last_upload_at, photo_count')
+      .eq('user_id', userId)
+      .order('id', { ascending: false })
+      .limit(limit + 1);
+    if (statusParam !== 'all') query = query.eq('status', statusParam);
+    if (cursor != null) query = query.lt('id', cursor);
+
+    const { data, error } = await query;
+    if (error) {
+      log.error('[ProofPix] team-members list failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'List failed.'));
+    }
+    const rows = data || [];
+    const pageRows = rows.slice(0, limit);
+    const hasMore = rows.length > limit;
+    const nextCursor = hasMore ? encodeTeamMembersCursor(pageRows[pageRows.length - 1].id) : null;
+
+    return res.status(200).json({
+      team_members: pageRows,
+      next_cursor: nextCursor,
+    });
+  });
+
+  // POST /team-members/:token/revoke
+  //   Admin-driven revoke. Flips status → 'revoked', sets
+  //   revoked_at=NOW(). Idempotent — re-revoking is a no-op success.
+  //   Fire-and-forget callback to ProofPix proxy so it stops
+  //   accepting uploads with that token; failure is logged but
+  //   doesn't fail the response (admin can retry the revoke later).
+  router.post('/team-members/:token/revoke', teamMembersLimiter, requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+    const token = req.params.token;
+    if (!token || token.length > 128) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Malformed token.'));
+    }
+
+    const { data: existing, error: lookupErr } = await supabase
+      .from('proofpix_team_members')
+      .select('id, status')
+      .eq('user_id', userId)
+      .eq('proofpix_member_token', token)
+      .maybeSingle();
+    if (lookupErr) {
+      log.error('[ProofPix] team-member revoke lookup failed:', lookupErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Revoke lookup failed.'));
+    }
+    if (!existing) {
+      return res.status(404).json(errBody('NOT_FOUND', 'Team member not found.'));
+    }
+
+    if (existing.status !== 'revoked') {
+      const now = new Date().toISOString();
+      const { error: updErr } = await supabase
+        .from('proofpix_team_members')
+        .update({ status: 'revoked', revoked_at: now, updated_at: now })
+        .eq('id', existing.id);
+      if (updErr) {
+        log.error('[ProofPix] team-member revoke update failed:', updErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Revoke failed.'));
+      }
+      log.log(`[ProofPix] team-member revoked workspace=${userId} token=${token}`);
+    }
+
+    // Best-effort proxy callback. Never blocks the response — a proxy
+    // outage would otherwise strand admins who want to revoke while
+    // the proxy is down. If it fails we log; admin can revoke again
+    // once the proxy is back (idempotent on both sides).
+    notifyProxyOfRevoke(userId, token).catch((err) => {
+      log.warn('[ProofPix] proxy revoke callback failed:', err && err.message);
+    });
+
+    return res.status(200).json({ success: true });
+  });
+
   return router;
 };
+
+// Proxy-callback config lives at module scope so it's evaluated once
+// per process. If PROOFPIX_REVOKE_SHARED_SECRET is unset the callback
+// is skipped entirely — the DB row is still marked revoked, but the
+// proxy won't be notified. Set this env var on Railway before the
+// revoke feature is user-facing.
+const PROOFPIX_REVOKE_SHARED_SECRET = process.env.PROOFPIX_REVOKE_SHARED_SECRET || '';
+const PROOFPIX_PROXY_BASE = process.env.PROOFPIX_PROXY_BASE
+  || 'https://steadfast-blessing-production.up.railway.app';
+async function notifyProxyOfRevoke(workspaceUserId, memberToken) {
+  if (!PROOFPIX_REVOKE_SHARED_SECRET) return;   // callback disabled
+  const url = `${PROOFPIX_PROXY_BASE}/api/admin/${encodeURIComponent(workspaceUserId)}/tokens/${encodeURIComponent(memberToken)}/revoke`;
+  await axios.post(url, { revoked_at: new Date().toISOString() }, {
+    headers: {
+      'X-ProofPix-Signature': PROOFPIX_REVOKE_SHARED_SECRET,
+      'Content-Type': 'application/json',
+    },
+    timeout: 5000,
+    validateStatus: (s) => s >= 200 && s < 300,
+  });
+}
