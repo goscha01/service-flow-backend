@@ -65,6 +65,7 @@ function makeFakeSupabase(seed = {}) {
       if (f.kind === 'eq') return String(row[f.col]) === String(f.val);
       if (f.kind === 'is') return f.val === null ? row[f.col] == null : row[f.col] === f.val;
       if (f.kind === 'in') return f.vals.map(String).includes(String(row[f.col]));
+      if (f.kind === 'gte') return row[f.col] != null && String(row[f.col]) >= String(f.val);
       if (f.kind === 'or') return f.clauses.some((c) => matchOrClause(row, c));
       return true;
     }
@@ -150,6 +151,7 @@ function makeFakeSupabase(seed = {}) {
       eq(col, val) { state.filters.push({ kind: 'eq', col, val }); return chain; },
       is(col, val) { state.filters.push({ kind: 'is', col, val }); return chain; },
       in(col, vals) { state.filters.push({ kind: 'in', col, vals }); return chain; },
+      gte(col, val) { state.filters.push({ kind: 'gte', col, val }); return chain; },
       or(str) {
         const clauses = splitTop(str);
         state.filters.push({ kind: 'or', clauses });
@@ -304,7 +306,8 @@ describe('GET /jobs — shape and fields', () => {
       .set('Authorization', `Bearer ${accessTokenFor(1)}`)
       .send();
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ jobs: [], next_cursor: null });
+    expect(res.body.jobs).toEqual([]);
+    expect(res.body.next_cursor).toBeNull();
   });
 
   test('shapes a job correctly: id string, title, customer_name, address, status bucket, scheduled_at ms, photo_count', async () => {
@@ -1396,5 +1399,153 @@ describe('GET /jobs — recurring-job visibility', () => {
     expect(res.status).toBe(200);
     const ids = res.body.jobs.map((j) => j.id).sort();
     expect(ids).toEqual(['700', '701']);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-request include_recurring override
+// ─────────────────────────────────────────────────────────────────────
+
+describe('GET /jobs — include_recurring per-request override', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('include_recurring=true overrides workspace default OFF (shows recurring)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' /* flag off */ }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 800, status: 'confirmed', is_recurring: true }),
+        makeJob({ id: 801, status: 'confirmed', is_recurring: false }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all&limit=100&include_recurring=true')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['800', '801']);
+    expect(res.body.filters.include_recurring).toBe(true);
+    expect(res.body.filters.workspace_show_recurring_jobs).toBe(false);
+  });
+
+  test('include_recurring=false overrides workspace default ON (hides recurring)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b', proofpix_show_recurring_jobs: true }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 800, status: 'confirmed', is_recurring: true }),
+        makeJob({ id: 801, status: 'confirmed', is_recurring: false }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all&limit=100&include_recurring=false')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['801']);
+    expect(res.body.filters.include_recurring).toBe(false);
+    expect(res.body.filters.workspace_show_recurring_jobs).toBe(true);
+  });
+
+  test('absent include_recurring falls back to workspace setting', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b', proofpix_show_recurring_jobs: true }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 800, status: 'confirmed', is_recurring: true }),
+        makeJob({ id: 801, status: 'confirmed', is_recurring: false }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=all&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['800', '801']);
+    expect(res.body.filters.include_recurring).toBe(true);
+  });
+
+  test('include_recurring="yes" → 400', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?include_recurring=yes')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_PAYLOAD');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// since (date-window) filter
+// ─────────────────────────────────────────────────────────────────────
+
+describe('GET /jobs — since= date filter', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('since=2026-08-01 drops jobs scheduled before that date, keeps on/after', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 900, status: 'scheduled', scheduled_date: '2025-06-15' }), // stale — drop
+        makeJob({ id: 901, status: 'scheduled', scheduled_date: '2026-07-31' }), // day before — drop
+        makeJob({ id: 902, status: 'scheduled', scheduled_date: '2026-08-01' }), // boundary — keep
+        makeJob({ id: 903, status: 'scheduled', scheduled_date: '2026-09-01 14:30:00' }), // future w/ time — keep
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=open&limit=100&since=2026-08-01')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['902', '903']);
+    expect(res.body.filters.since).toBe('2026-08-01');
+  });
+
+  test('since absent → no date filter (backward compat)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 900, status: 'scheduled', scheduled_date: '2025-06-15' }),
+        makeJob({ id: 902, status: 'scheduled', scheduled_date: '2026-08-01' }),
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=open&limit=100')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['900', '902']);
+    expect(res.body.filters.since).toBeNull();
+  });
+
+  test('since="2026/08/01" → 400 (only ISO YYYY-MM-DD accepted)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?since=2026/08/01')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_PAYLOAD');
+  });
+
+  test('since combines with include_recurring override', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' /* flag off */ }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [
+        makeJob({ id: 910, status: 'scheduled', scheduled_date: '2025-01-01', is_recurring: true }),   // stale recurring
+        makeJob({ id: 911, status: 'scheduled', scheduled_date: '2026-09-01', is_recurring: true }),   // future recurring
+        makeJob({ id: 912, status: 'scheduled', scheduled_date: '2026-09-01', is_recurring: false }),  // future one-off
+      ],
+    });
+    const res = await request(makeApp(supa))
+      .get('/api/integrations/proofpix/jobs?status=open&limit=100&since=2026-08-21&include_recurring=true')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['911', '912']);
   });
 });
