@@ -25432,6 +25432,30 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
     const effectiveStart = (mgrStart && (!periodStart || mgrStart > periodStart)) ? mgrStart : (periodStart || mgrStart || todayStr);
     if (!effectiveStart || effectiveStart > effectiveEnd) continue;
 
+    // Deactivated managers/schedulers: don't auto-generate new salary/commission
+    // rows, and delete any unpaid auto-generated rows already inserted for them
+    // in this period (self-heal from before this guard existed — e.g. Queeny).
+    // Paid rows are immutable per Constitution §3.1 and are left alone.
+    if ((mgr.status || '').toLowerCase() === 'inactive') {
+      const { data: stalePhantomRows } = await supabase.from('cleaner_ledger')
+        .select('id, metadata')
+        .eq('user_id', userId)
+        .eq('team_member_id', mgr.id)
+        .is('job_id', null)
+        .eq('type', 'earning')
+        .is('payout_batch_id', null)
+        .gte('effective_date', effectiveStart)
+        .lte('effective_date', effectiveEnd);
+      const phantomIds = (stalePhantomRows || [])
+        .filter(r => r.metadata?.is_manager_salary || r.metadata?.is_manager_commission)
+        .map(r => r.id);
+      if (phantomIds.length > 0) {
+        await supabase.from('cleaner_ledger').delete().in('id', phantomIds).is('payout_batch_id', null);
+        console.log(`[Payroll] Deleted ${phantomIds.length} phantom manager entries for inactive ${mgr.first_name} ${mgr.last_name} (${effectiveStart} to ${effectiveEnd})`);
+      }
+      continue;
+    }
+
     // Fetch existing entries for this member in the period
     let existingEntries = [];
     let from = 0;
