@@ -29,7 +29,7 @@ const { FLAGS, isEnabled, isEnabledForTenant } = require('./lib/feature-flags')
 const { setIdentityLead, setIdentityCustomer } = require('./lib/identity-linker')
 const { makeAdapter: makeLbEngineAdapter } = require('./lib/lb-engine-adapter')
 const { authenticateWebhook } = require('./lib/webhook-signature')
-const { pickLBSource, pickLBSources, pickLbLink, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
+const { pickLBSource, pickLBSources, pickLbLink, pickLbSpend, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
 const { setCustomerAcquisitionIfMissing } = require('./lib/lb-linkage-resolver')
 const { loadSourceMappings } = require('./lib/integration-sync-orchestrator')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
@@ -490,6 +490,7 @@ module.exports = (supabase, logger) => {
     // the caller didn't pass an explicit lbExternalRequestId, these are NULL
     // and the lead behaves like any other SF-native lead (no outbound).
     const lbLink = pickLbLink(input)
+    const lbSpend = pickLbSpend(input)
 
     const { data: newLead, error } = await supabase.from('opportunities').insert({
       user_id: userId,
@@ -507,6 +508,8 @@ module.exports = (supabase, logger) => {
       lb_channel: lbLink.lb_channel,
       lb_business_id: lbLink.lb_business_id,
       lb_provider_account_id: lbLink.lb_provider_account_id,
+      opportunity_cost: lbSpend.opportunity_cost,       // mig 082 — TT lead price in dollars, null when unknown
+      budget_voided_at: lbSpend.budget_voided_at,       // mig 082 — LB refund/void gate
     }).select().single()
 
     if (error) { logger.error('[LB Lead] Create error:', error.message); return null }
@@ -577,6 +580,7 @@ module.exports = (supabase, logger) => {
     // therefore emit to the child's externalRequestId, which is the
     // correct LB-side target for that acquisition.
     const lbLink = pickLbLink(input)
+    const lbSpend = pickLbSpend(input)
 
     const { data: newChild, error } = await supabase.from('opportunities').insert({
       user_id: userId,
@@ -595,6 +599,8 @@ module.exports = (supabase, logger) => {
       lb_channel: lbLink.lb_channel,
       lb_business_id: lbLink.lb_business_id,
       lb_provider_account_id: lbLink.lb_provider_account_id,
+      opportunity_cost: lbSpend.opportunity_cost,       // mig 082 — child acquisition = its own charge event
+      budget_voided_at: lbSpend.budget_voided_at,
     }).select().single()
 
     if (error) {
@@ -3045,6 +3051,13 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
       const lbChannel = channel || null
       const lbBusinessId = thread.external_business_id || event.business_id || null
       const lbProviderAccountId = resolvedAccountId || null
+      // mig 082 — Thumbtack per-lead cost + LB refund/void gate. Optional
+      // fields on the LB webhook payload's `lead` object (see LB
+      // src/crm-webhooks/crm-webhook.service.ts CrmEventPayload.lead).
+      // Null-safe if LB hasn't shipped the contract extension yet.
+      const eventLead = event.lead || {}
+      const leadPriceCents = eventLead.leadPriceCents ?? eventLead.lead_price_cents ?? null
+      const budgetVoidedAt = eventLead.budgetVoidedAt ?? eventLead.budget_voided_at ?? null
 
       if (prereq.useEngine) {
         // Stage 2 engine path — identity resolution + lead-create in one call.
@@ -3062,6 +3075,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
             lbChannel,
             lbBusinessId,
             lbProviderAccountId,
+            leadPriceCents,
+            budgetVoidedAt,
           })
           identity = engineIdentity
         } catch (e) {
@@ -3079,6 +3094,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
           lbChannel,
           lbBusinessId,
           lbProviderAccountId,
+          leadPriceCents,
+          budgetVoidedAt,
         }).catch(e => logger.warn(`[LB Webhook] Lead resolution: ${e.message}`))
       }
 
@@ -3249,6 +3266,11 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
               const lbChannelVal = channel || null
               const lbBusinessId = lead.businessId || acct.external_business_id || null
               const lbProviderAccountId = acct.id || null
+              // mig 082 — spend/refund pass-through from LB's NormalizedLead.
+              // Optional. Null when LB hasn't shipped the contract extension
+              // or when the platform has no cost concept (Yelp).
+              const leadPriceCents = lead.leadPriceCents ?? lead.lead_price_cents ?? null
+              const budgetVoidedAt = lead.budgetVoidedAt ?? lead.budget_voided_at ?? null
 
               let identity = null
               if (prereq.useEngine) {
@@ -3266,6 +3288,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
                   lbChannel: lbChannelVal,
                   lbBusinessId,
                   lbProviderAccountId,
+                  leadPriceCents,
+                  budgetVoidedAt,
                 })
                 identity = engineIdentity
               } else {
@@ -3290,6 +3314,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
                     lbChannel: lbChannelVal,
                     lbBusinessId,
                     lbProviderAccountId,
+                    leadPriceCents,
+                    budgetVoidedAt,
                   })
                 }
               }

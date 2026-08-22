@@ -1120,6 +1120,7 @@ let jobExpenseRouter = null;
 try { jobExpenseRouter = require('./job-expense-service')(supabase, logger); app.use('/api', jobExpenseRouter); } catch (e) { console.log('Job expense module not loaded:', e.message); }
 let businessExpenseModule = null;
 try { businessExpenseModule = require('./business-expense-service'); app.use('/api/business-expenses', businessExpenseModule(supabase, logger)); } catch (e) { console.log('Business expense module not loaded:', e.message); }
+try { app.use('/api/marketing-spend', require('./marketing-spend-service')(supabase, logger)); } catch (e) { console.log('Marketing spend module not loaded:', e.message); }
 
 // Connected Email (Gmail/Outlook OAuth) — System 2 for Communications Hub.
 // Loosely coupled: removing this block + services/connected-email/ = feature gone, zero side effects.
@@ -27288,73 +27289,70 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
 
 // ══════════════════════════════════════════════════════════════════════
 // Expenses analytics — thin summary endpoints for the Expenses tab.
-// Job-level reimbursements come from job_expenses (mig 013). Ad spend
-// comes from opportunities.opportunity_cost (mig 076). Recurring/one-off
+// Job-level reimbursements come from job_expenses (mig 013). Recurring
 // overhead comes from business_expenses (mig 081). Payroll is fetched
-// separately via /api/analytics/salary.
+// separately via /api/analytics/salary. Marketing/ad spend comes from
+// marketing_spend (mig 082) via lib/marketing-spend-aggregation.
 // ══════════════════════════════════════════════════════════════════════
 
 // GET /api/analytics/ads-spend?startDate&endDate
-// Sums opportunities.opportunity_cost filtered by opportunities.created_at.
-// Rationale: an ad is paid when the lead is acquired, regardless of when
-// the resulting job runs.
+//
+// Canonical marketing-spend read path. Reads ONLY from marketing_spend
+// (per-source per-month rows). Thumbtack rows are materialized from
+// opportunities.opportunity_cost via services/tt-spend-materializer.js;
+// Yelp/Google/Meta/LSA rows are manual or upstream-imported.
+//
+// Unknown spend is NOT $0 — sources with no marketing_spend rows return
+// null values (frontend renders as em-dash).
+//
+// Response envelope preserved for frontend compat with the previous
+// stub; the shape is stable across the mig 082 cutover.
 app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query;
+    const { getAdsSpendReport } = require('./lib/marketing-spend-aggregation');
 
-    let q = supabase
-      .from('opportunities')
-      .select('id, source, opportunity_cost, created_at')
-      .eq('user_id', userId)
-      .not('opportunity_cost', 'is', null);
+    const report = await getAdsSpendReport(supabase, { userId, startDate, endDate });
 
-    if (startDate) q = q.gte('created_at', startDate);
-    if (endDate) q = q.lte('created_at', `${endDate} 23:59:59`);
+    // Envelope contract: numbers in dollars for the frontend (existing UI
+    // reads .spend as dollars). Cents live at the DB/aggregation layer;
+    // this is the boundary conversion.
+    const bySource = report.bySource.map((r) => ({
+      source: r.source,
+      spend: r.spendCents / 100,
+      reportedSpend: r.reportedSpendCents != null ? r.reportedSpendCents / 100 : null,
+      count: r.leadCount,
+      cpl: r.cplCents != null ? r.cplCents / 100 : null,
+      months: r.months,
+      isManualOverride: r.isManualOverride,
+      sourceTypes: r.sourceTypes,
+    }));
 
-    const { data, error } = await q;
-    if (error) throw error;
-
-    const rows = data || [];
-    const total = rows.reduce((s, r) => s + (parseFloat(r.opportunity_cost) || 0), 0);
-
-    // Group by source (Thumbtack, Yelp, Google, …)
-    const bySourceMap = {};
-    rows.forEach(r => {
-      const src = r.source || 'Unknown';
-      if (!bySourceMap[src]) bySourceMap[src] = { source: src, spend: 0, count: 0 };
-      bySourceMap[src].spend += parseFloat(r.opportunity_cost) || 0;
-      bySourceMap[src].count += 1;
-    });
-    const bySource = Object.values(bySourceMap).sort((a, b) => b.spend - a.spend);
-
-    // Monthly buckets for a stacked/trend chart (last 12 months anchored to endDate or today)
+    // Build a 12-month grid anchored to endDate so the chart always shows
+    // the full window even when a month had no spend.
     const anchor = endDate ? new Date(endDate) : new Date();
     const monthly = [];
     for (let i = 11; i >= 0; i--) {
       const d = new Date(anchor.getFullYear(), anchor.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
       monthly.push({
-        key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`,
+        key,
         label: d.toLocaleString('en-US', { month: 'short' }),
         spend: 0,
         count: 0,
       });
     }
-    rows.forEach(r => {
-      const d = new Date(r.created_at);
-      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-      const row = monthly.find(m => m.key === k);
-      if (row) {
-        row.spend += parseFloat(r.opportunity_cost) || 0;
-        row.count += 1;
-      }
-    });
+    for (const m of report.monthly) {
+      const row = monthly.find((x) => x.key === m.monthKey);
+      if (row) row.spend = m.spendCents / 100;
+    }
 
     res.json({
       summary: {
-        totalSpend: Math.round(total * 100) / 100,
-        opportunityCount: rows.length,
-        avgCostPerLead: rows.length > 0 ? Math.round((total / rows.length) * 100) / 100 : 0,
+        totalSpend: report.summary.totalSpendCents / 100,
+        opportunityCount: report.summary.opportunityCount,
+        avgCostPerLead: report.summary.avgCplCents != null ? report.summary.avgCplCents / 100 : null,
       },
       bySource,
       monthly,
@@ -27362,6 +27360,30 @@ app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
   } catch (e) {
     console.error('ads-spend failed:', e);
     res.status(500).json({ error: 'Failed to compute ads spend' });
+  }
+});
+
+// POST /api/marketing-spend/materialize/thumbtack
+// Body: { startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD', splitByAccount?: false }
+// Recomputes derived TT rows for the range. Idempotent, respects manual overrides.
+// Called by the Expenses UI's "Sync Thumbtack" button and by the historical
+// backfill script after opportunity_cost has been populated.
+app.post('/api/marketing-spend/materialize/thumbtack', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, splitByAccount } = req.body || {};
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'startDate and endDate are required (YYYY-MM-DD)' });
+    }
+    const { materializeThumbtackSpend } = require('./services/tt-spend-materializer');
+    const result = await materializeThumbtackSpend(supabase, logger, {
+      userId, startDate, endDate,
+      splitByAccount: !!splitByAccount,
+    });
+    res.json(result);
+  } catch (e) {
+    console.error('materialize thumbtack failed:', e);
+    res.status(500).json({ error: e.message || 'Failed to materialize Thumbtack spend' });
   }
 });
 
