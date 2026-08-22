@@ -1118,6 +1118,8 @@ let jobNotifications = null; try { jobNotifications = require('./job-notificatio
 try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, notificationEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
 let jobExpenseRouter = null;
 try { jobExpenseRouter = require('./job-expense-service')(supabase, logger); app.use('/api', jobExpenseRouter); } catch (e) { console.log('Job expense module not loaded:', e.message); }
+let businessExpenseModule = null;
+try { businessExpenseModule = require('./business-expense-service'); app.use('/api/business-expenses', businessExpenseModule(supabase, logger)); } catch (e) { console.log('Business expense module not loaded:', e.message); }
 
 // Connected Email (Gmail/Outlook OAuth) — System 2 for Communications Hub.
 // Loosely coupled: removing this block + services/connected-email/ = feature gone, zero side effects.
@@ -27283,6 +27285,184 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
 //
 // Runs in the background (setImmediate); client polls /progress until
 // status === 'done'.
+
+// ══════════════════════════════════════════════════════════════════════
+// Expenses analytics — thin summary endpoints for the Expenses tab.
+// Job-level reimbursements come from job_expenses (mig 013). Ad spend
+// comes from opportunities.opportunity_cost (mig 076). Recurring/one-off
+// overhead comes from business_expenses (mig 081). Payroll is fetched
+// separately via /api/analytics/salary.
+// ══════════════════════════════════════════════════════════════════════
+
+// GET /api/analytics/ads-spend?startDate&endDate
+// Sums opportunities.opportunity_cost filtered by opportunities.created_at.
+// Rationale: an ad is paid when the lead is acquired, regardless of when
+// the resulting job runs.
+app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate } = req.query;
+
+    let q = supabase
+      .from('opportunities')
+      .select('id, source, opportunity_cost, created_at')
+      .eq('user_id', userId)
+      .not('opportunity_cost', 'is', null);
+
+    if (startDate) q = q.gte('created_at', startDate);
+    if (endDate) q = q.lte('created_at', `${endDate} 23:59:59`);
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    const rows = data || [];
+    const total = rows.reduce((s, r) => s + (parseFloat(r.opportunity_cost) || 0), 0);
+
+    // Group by source (Thumbtack, Yelp, Google, …)
+    const bySourceMap = {};
+    rows.forEach(r => {
+      const src = r.source || 'Unknown';
+      if (!bySourceMap[src]) bySourceMap[src] = { source: src, spend: 0, count: 0 };
+      bySourceMap[src].spend += parseFloat(r.opportunity_cost) || 0;
+      bySourceMap[src].count += 1;
+    });
+    const bySource = Object.values(bySourceMap).sort((a, b) => b.spend - a.spend);
+
+    // Monthly buckets for a stacked/trend chart (last 12 months anchored to endDate or today)
+    const anchor = endDate ? new Date(endDate) : new Date();
+    const monthly = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(anchor.getFullYear(), anchor.getMonth() - i, 1);
+      monthly.push({
+        key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`,
+        label: d.toLocaleString('en-US', { month: 'short' }),
+        spend: 0,
+        count: 0,
+      });
+    }
+    rows.forEach(r => {
+      const d = new Date(r.created_at);
+      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const row = monthly.find(m => m.key === k);
+      if (row) {
+        row.spend += parseFloat(r.opportunity_cost) || 0;
+        row.count += 1;
+      }
+    });
+
+    res.json({
+      summary: {
+        totalSpend: Math.round(total * 100) / 100,
+        opportunityCount: rows.length,
+        avgCostPerLead: rows.length > 0 ? Math.round((total / rows.length) * 100) / 100 : 0,
+      },
+      bySource,
+      monthly,
+    });
+  } catch (e) {
+    console.error('ads-spend failed:', e);
+    res.status(500).json({ error: 'Failed to compute ads spend' });
+  }
+});
+
+// GET /api/analytics/expenses-summary?startDate&endDate
+// Combines:
+//   - job_expenses (approved, reimbursable, per-job) — flows through payroll
+//     but is surfaced here as its own expense line so the operator can see
+//     "how much are cleaner reimbursements costing me"
+//   - business_expenses (rent, SaaS, insurance, etc.) — expanded per cadence
+//     inside the date range, not persisted per-occurrence.
+app.get('/api/analytics/expenses-summary', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate } = req.query;
+
+    // Default range = last 30 days if omitted
+    const end = endDate ? new Date(endDate) : new Date();
+    const start = startDate ? new Date(startDate) : new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const startStr = start.toISOString().split('T')[0];
+    const endStr = end.toISOString().split('T')[0];
+
+    // — job_expenses: approved & company-paid or reimbursable-to-member.
+    // These are the operator's actual cash outflow for jobs.
+    let jobExpQ = supabase
+      .from('job_expenses')
+      .select('id, amount, paid_by, reimbursable_to_team_member, expense_type, status, created_at, job_id, jobs(scheduled_date)')
+      .eq('user_id', userId)
+      .eq('status', 'approved');
+    const { data: jobExpRows, error: jobExpErr } = await jobExpQ;
+    if (jobExpErr) throw jobExpErr;
+
+    const isOperatorCost = (e) => {
+      // Operator pays when: company paid it, OR team_member paid it AND we owe reimbursement.
+      // Deductions are money coming back FROM team member (not a cost). Customer-paid = no cost to us.
+      if (e.paid_by === 'company') return true;
+      if (e.paid_by === 'team_member' && e.reimbursable_to_team_member) return true;
+      return false;
+    };
+    const inRange = (dateStr) => {
+      if (!dateStr) return false;
+      const d = String(dateStr).split('T')[0].split(' ')[0];
+      return d >= startStr && d <= endStr;
+    };
+    const attributedDate = (row) =>
+      (row.jobs?.scheduled_date && String(row.jobs.scheduled_date).split('T')[0].split(' ')[0]) ||
+      (row.created_at && String(row.created_at).split('T')[0]);
+
+    const jobExpensesInRange = (jobExpRows || []).filter(r => isOperatorCost(r) && inRange(attributedDate(r)));
+    const jobExpensesTotal = jobExpensesInRange.reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+
+    const jobExpensesByType = {};
+    jobExpensesInRange.forEach(r => {
+      const k = r.expense_type || 'other';
+      jobExpensesByType[k] = (jobExpensesByType[k] || 0) + (parseFloat(r.amount) || 0);
+    });
+
+    // — business_expenses: expand each row's cadence inside the range
+    const businessSvc = businessExpenseModule;
+    const { data: bizRows, error: bizErr } = await supabase
+      .from('business_expenses')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('is_active', true);
+    if (bizErr) throw bizErr;
+
+    const businessExpanded = (bizRows || []).map(exp => {
+      const occurrences = businessSvc?.occurrencesInRange
+        ? businessSvc.occurrencesInRange(exp, start, end)
+        : 0;
+      const rangeAmount = occurrences * (parseFloat(exp.amount) || 0);
+      return { ...exp, occurrences, rangeAmount };
+    }).filter(x => x.occurrences > 0);
+
+    const businessTotal = businessExpanded.reduce((s, r) => s + r.rangeAmount, 0);
+
+    const businessByCategory = {};
+    businessExpanded.forEach(r => {
+      const k = r.category || 'other';
+      businessByCategory[k] = (businessByCategory[k] || 0) + r.rangeAmount;
+    });
+
+    res.json({
+      summary: {
+        jobExpensesTotal: Math.round(jobExpensesTotal * 100) / 100,
+        jobExpensesCount: jobExpensesInRange.length,
+        businessExpensesTotal: Math.round(businessTotal * 100) / 100,
+        businessExpensesCount: businessExpanded.length,
+        combinedTotal: Math.round((jobExpensesTotal + businessTotal) * 100) / 100,
+      },
+      jobExpensesByType,
+      businessByCategory,
+      businessExpanded: businessExpanded.map(x => ({
+        id: x.id, name: x.name, category: x.category, cadence: x.cadence,
+        amount: parseFloat(x.amount) || 0, occurrences: x.occurrences, rangeAmount: x.rangeAmount,
+      })),
+    });
+  } catch (e) {
+    console.error('expenses-summary failed:', e);
+    res.status(500).json({ error: 'Failed to compute expenses summary' });
+  }
+});
 
 const teamAvailabilitySyncProgress = {}; // userId → { status, startedAt, summary, error }
 
