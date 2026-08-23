@@ -98,7 +98,10 @@ module.exports = (supabase, logger) => {
         .order('period_start', { ascending: false })
 
       if (source && VALID_SOURCES.includes(source)) q = q.eq('source', source)
-      if (startDate) q = q.gte('period_start', startDate)
+      // Overlap semantics — matches lib/marketing-spend-aggregation.js:getEffectiveSpend
+      // so the analytics rollup and the CRUD list agree. Any month whose period
+      // touches the query range appears in results.
+      if (startDate) q = q.gte('period_end', startDate)
       if (endDate) q = q.lte('period_start', endDate)
 
       const { data, error } = await q
