@@ -42,6 +42,7 @@ function makeStore({ marketing_spend = [], opportunities = [] } = {}) {
       lte: (col, val) => { filters.push({ op: 'lte', col, val }); return q; },
       not: (col, _op, val) => { filters.push({ op: 'not', col, val }); return q; },
       in: (col, vals) => { filters.push({ op: 'in', col, vals }); return q; },
+      or: (expr) => { filters.push({ op: 'or', expr }); return q; },
       order: () => q,
       then: (resolve, reject) => resolve(runSelect(table, filters)),
       maybeSingle: async () => {
@@ -65,6 +66,21 @@ function makeStore({ marketing_spend = [], opportunities = [] } = {}) {
       else if (f.op === 'lte') rows = rows.filter((r) => String(r[f.col]) <= String(f.val));
       else if (f.op === 'not' && f.val === null) rows = rows.filter((r) => r[f.col] != null);
       else if (f.op === 'in') rows = rows.filter((r) => f.vals.includes(r[f.col]));
+      else if (f.op === 'or') {
+        // Supabase .or() syntax: "col.op.val,col.op.val". Support eq/ilike.
+        const clauses = String(f.expr).split(',').map((c) => {
+          const [col, op, ...rest] = c.split('.');
+          return { col, op, val: rest.join('.') };
+        });
+        rows = rows.filter((r) => clauses.some((c) => {
+          if (c.op === 'eq') return r[c.col] === c.val;
+          if (c.op === 'ilike') {
+            const pat = c.val.replace(/%/g, '.*');
+            return typeof r[c.col] === 'string' && new RegExp(`^${pat}$`, 'i').test(r[c.col]);
+          }
+          return false;
+        }));
+      }
     }
     return { data: rows, error: null };
   };

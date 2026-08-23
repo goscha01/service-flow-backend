@@ -29,9 +29,10 @@
 
 const { upsertReportedSpend } = require('../lib/marketing-spend-upsert')
 
-// Source label used by opportunities.source to identify Thumbtack.
-// LB writes lowercase 'thumbtack' via lib/lb-ingestion.js. Existing rows
-// may use various casings from CSV import.
+// Source keys retained for the tests (exact-match short values e.g. CSV import).
+// The production query uses a permissive filter (lb_channel=thumbtack OR
+// source ILIKE '%thumbtack%') because pickLBSources writes per-account labels
+// like "Georgiy Sayapin (thumbtack)" — an exact list would miss them.
 const TT_SOURCE_KEYS = ['thumbtack', 'Thumbtack', 'THUMBTACK']
 
 /**
@@ -61,11 +62,16 @@ async function materializeThumbtackSpend(supabase, logger, { userId, startDate, 
   const startStr = start.toISOString().slice(0, 10)
   const endStr = end.toISOString().slice(0, 10)
 
+  // Match Thumbtack the same way the backfill does: lb_channel exact, OR
+  // source label contains 'thumbtack' (case-insensitive). pickLBSources
+  // writes per-account labels like "Georgiy Sayapin (thumbtack)" — an
+  // exact source='thumbtack' filter misses those. CSV-imported rows keep
+  // matching via the ILIKE branch too.
   const { data: opps, error } = await supabase
     .from('opportunities')
-    .select('id, source, opportunity_cost, budget_voided_at, created_at, lb_provider_account_id')
+    .select('id, source, lb_channel, opportunity_cost, budget_voided_at, created_at, lb_provider_account_id')
     .eq('user_id', userId)
-    .in('source', TT_SOURCE_KEYS)
+    .or('lb_channel.eq.thumbtack,source.ilike.%thumbtack%')
     .gte('created_at', startStr)
     .lte('created_at', `${endStr} 23:59:59`)
 
