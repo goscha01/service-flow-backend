@@ -119,8 +119,8 @@ module.exports = (supabase, logger) => {
       if (error) throw error
       res.json({ spend: (data || []).map(hydrate) })
     } catch (e) {
-      logger?.error?.('marketing-spend list failed', e)
-      res.status(500).json({ error: 'Failed to load marketing spend' })
+      logger?.error?.(`marketing-spend list failed: ${e?.message || e} · stack: ${e?.stack?.split('\n')?.slice(0, 3)?.join(' | ')}`)
+      res.status(500).json({ error: 'Failed to load marketing spend', detail: e?.message })
     }
   })
 

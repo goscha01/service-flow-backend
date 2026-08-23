@@ -27370,8 +27370,8 @@ app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
       monthly,
     });
   } catch (e) {
-    console.error('ads-spend failed:', e);
-    res.status(500).json({ error: 'Failed to compute ads spend' });
+    console.error('ads-spend failed:', e?.message || e, e?.stack);
+    res.status(500).json({ error: 'Failed to compute ads spend', detail: e?.message });
   }
 });
 
