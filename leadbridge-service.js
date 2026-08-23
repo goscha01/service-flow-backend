@@ -1093,6 +1093,36 @@ module.exports = (supabase, logger) => {
       }
 
       logger.log(`[LB] Connected for user ${userId}, ${accounts.length} accounts`)
+
+      // Fire-and-forget marketing-spend backfill+materialize so the operator
+      // sees populated Analytics right after Connect without clicking "Sync
+      // from LeadBridge" manually. Non-blocking — connect returns whether
+      // or not the backfill succeeds. New leads flow via webhook anyway;
+      // this only accelerates the FIRST view of historical months.
+      setImmediate(async () => {
+        try {
+          const { backfillThumbtackCost } = require('./services/tt-cost-backfill')
+          const { materializeThumbtackSpend } = require('./services/tt-spend-materializer')
+          const bf = await backfillThumbtackCost(supabase, logger, { userId, apply: true })
+          if (bf.error) {
+            logger.warn(`[LB Connect → backfill] user=${userId} skipped: ${bf.error}`)
+            return
+          }
+          // Materialize the widest reasonable range so all months light up.
+          const now = new Date()
+          const twoYearsAgo = new Date(now.getFullYear() - 2, now.getMonth(), 1)
+          const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+          await materializeThumbtackSpend(supabase, logger, {
+            userId,
+            startDate: iso(twoYearsAgo),
+            endDate: iso(now),
+          })
+          logger.log(`[LB Connect → backfill] user=${userId} complete backfill_updated=${bf.updated || 0} eligible=${bf.eligible || 0}`)
+        } catch (e) {
+          logger.warn(`[LB Connect → backfill] user=${userId} failed: ${e.message}`)
+        }
+      })
+
       res.json({
         success: true,
         accounts,
