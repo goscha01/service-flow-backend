@@ -27344,6 +27344,7 @@ app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
       userId, startDate: historyStartStr, endDate: historyEndStr, locationId,
     });
     const historyMonthly = rollupByMonth(historyRows);
+    console.log(`[ads-spend] user=${userId} location=${locationId || 'all'} history_range=${historyStartStr}..${historyEndStr} rows=${historyRows.length} monthly=${historyMonthly.length} sample=${JSON.stringify(historyRows.slice(0, 3).map(r => ({s: r.source, ps: r.periodStart, cents: r.amountCents, acct: r.externalAccountId})))}`);
 
     const monthly = [];
     for (let i = 11; i >= 0; i--) {
