@@ -27311,8 +27311,9 @@ app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query;
-    const { getAdsSpendReport } = require('./lib/marketing-spend-aggregation');
+    const { getAdsSpendReport, getEffectiveSpend, rollupByMonth } = require('./lib/marketing-spend-aggregation');
 
+    // Period-scoped totals + per-source rollup (respect the period selector).
     const report = await getAdsSpendReport(supabase, { userId, startDate, endDate });
 
     // Envelope contract: numbers in dollars for the frontend (existing UI
@@ -27329,9 +27330,20 @@ app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
       sourceTypes: r.sourceTypes,
     }));
 
-    // Build a 12-month grid anchored to endDate so the chart always shows
-    // the full window even when a month had no spend.
+    // 12-month trend chart is a HISTORICAL view — independent of the
+    // period selector. Always fetches the last 12 months of spend so the
+    // chart is meaningful regardless of whether the user picked 7d / 30d / YTD.
     const anchor = endDate ? new Date(endDate) : new Date();
+    const historyEnd = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0);   // last day of anchor month
+    const historyStart = new Date(anchor.getFullYear(), anchor.getMonth() - 11, 1); // first day of 12mo-ago month
+    const historyStartStr = historyStart.toISOString().slice(0, 10);
+    const historyEndStr = historyEnd.toISOString().slice(0, 10);
+
+    const historyRows = await getEffectiveSpend(supabase, {
+      userId, startDate: historyStartStr, endDate: historyEndStr,
+    });
+    const historyMonthly = rollupByMonth(historyRows);
+
     const monthly = [];
     for (let i = 11; i >= 0; i--) {
       const d = new Date(anchor.getFullYear(), anchor.getMonth() - i, 1);
@@ -27343,9 +27355,9 @@ app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
         count: 0,
       });
     }
-    for (const m of report.monthly) {
+    for (const m of historyMonthly) {
       const row = monthly.find((x) => x.key === m.monthKey);
-      if (row) row.spend = m.spendCents / 100;
+      if (row) row.spend += m.amountCents / 100;
     }
 
     res.json({
