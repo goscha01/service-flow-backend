@@ -63,8 +63,16 @@ async function backfillThumbtackCost(supabase, logger, { userId, startDate = nul
     })
     lbLeads = lbResp.data?.leads || []
   } catch (e) {
-    logger?.error?.(`[tt-cost-backfill] LB /v1/leads failed: ${e.response?.status} ${e.message}`)
-    return { error: 'lb_fetch_failed', status: e.response?.status || 0, message: e.message }
+    const status = e.response?.status || 0
+    logger?.error?.(`[tt-cost-backfill] LB /v1/leads failed: ${status} ${e.message}`)
+    if (status === 401) {
+      return {
+        error: 'lb_token_expired',
+        status,
+        message: 'Your LeadBridge session token has expired. Reconnect the integration in Settings → LeadBridge, then try again.',
+      }
+    }
+    return { error: 'lb_fetch_failed', status, message: e.message }
   }
   logger?.log?.(`[tt-cost-backfill] user=${userId} lb_leads=${lbLeads.length} sf_opps=${sfOpps.length} apply=${apply}`)
 
