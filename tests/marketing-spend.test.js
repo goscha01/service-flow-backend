@@ -337,7 +337,7 @@ describe('marketing-spend-aggregation', () => {
     expect(yelp.cplCents).toBeNull();       // NOT 0
   });
 
-  test('case 14b — no marketing_spend row => source absent from bySource (unknown ≠ $0)', async () => {
+  test('case 14b — no marketing_spend row but has leads => bySource entry with spend=null (unknown ≠ $0)', async () => {
     const store = makeStore({
       marketing_spend: [],
       opportunities: [
@@ -348,7 +348,10 @@ describe('marketing-spend-aggregation', () => {
       userId: 1, startDate: '2026-08-01', endDate: '2026-08-31',
     });
     const google = report.bySource.find((r) => r.source === 'google_ads');
-    expect(google).toBeUndefined();          // no row for unknown spend
+    expect(google).toBeDefined();
+    expect(google.spendCents).toBeNull();     // spend unknown, NOT $0
+    expect(google.leadCount).toBe(1);
+    expect(google.cplCents).toBeNull();
   });
 });
 
