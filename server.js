@@ -56,6 +56,7 @@ const { syncAvailabilityFromZenbooker: syncAvailabilityOnlyFromZb } = require('.
 const { updateJobStatus: jobStatusServiceUpdate } = require('./services/job-status-service');
 const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
 const { startDrainer: startLbOrchestrationWebhookDrainer } = require('./workers/lb-orchestration-webhook-drainer');
+const { start: startMarketingSpendMaterializeCron } = require('./workers/marketing-spend-materialize-cron');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const identityGraphViolation = require('./lib/identity-graph-violation');
@@ -39053,6 +39054,18 @@ app.listen(PORT, async () => {
     startZbAvailabilityReconcileCron({ supabase, logger });
   } catch (e) {
     logger.error(`[ZBAvailabilityReconcileCron] Failed to start: ${e.message}`);
+  }
+
+  // Marketing spend materialization cron. Nightly re-materializes the last
+  // 3 months of Thumbtack marketing_spend rows from opportunities.opportunity_cost
+  // so operators don't have to click "Sync from LeadBridge" to see fresh
+  // monthly totals. New TT leads with cost land via LB webhook in real time;
+  // this cron only needs to keep the monthly rollup fresh. Gated by
+  // MARKETING_SPEND_MATERIALIZE_ENABLED. See workers/marketing-spend-materialize-cron.js.
+  try {
+    startMarketingSpendMaterializeCron(supabase, logger);
+  } catch (e) {
+    logger.error(`[MarketingSpendMaterializeCron] Failed to start: ${e.message}`);
   }
 
   // S4 — Orchestration webhook outbox drainer.
