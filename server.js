@@ -27310,11 +27310,11 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
 app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, locationId } = req.query;
     const { getAdsSpendReport, getEffectiveSpend, rollupByMonth } = require('./lib/marketing-spend-aggregation');
 
     // Period-scoped totals + per-source rollup (respect the period selector).
-    const report = await getAdsSpendReport(supabase, { userId, startDate, endDate });
+    const report = await getAdsSpendReport(supabase, { userId, startDate, endDate, locationId });
 
     // Envelope contract: numbers in dollars for the frontend (existing UI
     // reads .spend as dollars). Cents live at the DB/aggregation layer;
@@ -27340,7 +27340,7 @@ app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
     const historyEndStr = historyEnd.toISOString().slice(0, 10);
 
     const historyRows = await getEffectiveSpend(supabase, {
-      userId, startDate: historyStartStr, endDate: historyEndStr,
+      userId, startDate: historyStartStr, endDate: historyEndStr, locationId,
     });
     const historyMonthly = rollupByMonth(historyRows);
 

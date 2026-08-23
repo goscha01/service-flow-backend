@@ -89,7 +89,17 @@ module.exports = (supabase, logger) => {
   router.get('/', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
-      const { startDate, endDate, source } = req.query
+      const { startDate, endDate, source, locationId } = req.query
+
+      // Location scoping — resolve territory → LB account ids.
+      let allowedAccounts = null
+      if (locationId && locationId !== 'all') {
+        const { getLbAccountsForTerritory } = require('./lib/marketing-spend-aggregation')
+        allowedAccounts = await getLbAccountsForTerritory(supabase, userId, locationId)
+        if (!allowedAccounts || allowedAccounts.length === 0) {
+          return res.json({ spend: [] })
+        }
+      }
 
       let q = supabase
         .from('marketing_spend')
@@ -103,6 +113,7 @@ module.exports = (supabase, logger) => {
       // touches the query range appears in results.
       if (startDate) q = q.gte('period_end', startDate)
       if (endDate) q = q.lte('period_start', endDate)
+      if (allowedAccounts) q = q.in('external_account_id', allowedAccounts.map(String))
 
       const { data, error } = await q
       if (error) throw error
