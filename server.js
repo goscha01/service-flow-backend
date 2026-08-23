@@ -27363,6 +27363,58 @@ app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/marketing-spend/backfill/thumbtack
+// Body: { startDate?, endDate?, apply?: false, materialize?: true }
+// Pulls LB /v1/leads?scope=all&platform=thumbtack via the tenant's LB token,
+// fills opportunities.opportunity_cost (fill-only) + budget_voided_at (refresh),
+// and optionally runs the monthly materializer.
+// Default is dry-run — reports counters without writing.
+app.post('/api/marketing-spend/backfill/thumbtack', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, apply = false, materialize = true } = req.body || {};
+    const { backfillThumbtackCost } = require('./services/tt-cost-backfill');
+    const backfillResult = await backfillThumbtackCost(supabase, logger, {
+      userId, startDate, endDate, apply: !!apply,
+    });
+
+    if (backfillResult.error) {
+      return res.status(400).json({ error: backfillResult.error, message: backfillResult.message });
+    }
+
+    // Optionally materialize monthly rows on the same range.
+    let materializeResult = null;
+    if (apply && materialize) {
+      const { materializeThumbtackSpend } = require('./services/tt-spend-materializer');
+      // Default range for materializer: fall back to opportunities table span
+      // if no explicit range was passed to the backfill.
+      let matStart = startDate;
+      let matEnd = endDate;
+      if (!matStart || !matEnd) {
+        const { data: bounds } = await supabase
+          .from('opportunities')
+          .select('created_at')
+          .eq('user_id', userId)
+          .not('lb_external_request_id', 'is', null)
+          .order('created_at', { ascending: true })
+          .limit(1);
+        if (bounds && bounds[0]) matStart = matStart || bounds[0].created_at.slice(0, 10);
+        matEnd = matEnd || new Date().toISOString().slice(0, 10);
+      }
+      if (matStart && matEnd) {
+        materializeResult = await materializeThumbtackSpend(supabase, logger, {
+          userId, startDate: matStart, endDate: matEnd,
+        });
+      }
+    }
+
+    res.json({ backfill: backfillResult, materialize: materializeResult });
+  } catch (e) {
+    console.error('backfill thumbtack failed:', e);
+    res.status(500).json({ error: e.message || 'Failed to backfill Thumbtack cost' });
+  }
+});
+
 // POST /api/marketing-spend/materialize/thumbtack
 // Body: { startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD', splitByAccount?: false }
 // Recomputes derived TT rows for the range. Idempotent, respects manual overrides.
