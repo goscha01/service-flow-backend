@@ -29,7 +29,7 @@ const { FLAGS, isEnabled, isEnabledForTenant } = require('./lib/feature-flags')
 const { setIdentityLead, setIdentityCustomer } = require('./lib/identity-linker')
 const { makeAdapter: makeLbEngineAdapter } = require('./lib/lb-engine-adapter')
 const { authenticateWebhook } = require('./lib/webhook-signature')
-const { pickLBSource, pickLBSources, pickLbLink, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
+const { pickLBSource, pickLBSources, pickLbLink, pickLbSpend, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
 const { setCustomerAcquisitionIfMissing } = require('./lib/lb-linkage-resolver')
 const { loadSourceMappings } = require('./lib/integration-sync-orchestrator')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
@@ -47,6 +47,9 @@ const { makeRequireOrchestrationEnabled } = require('./lib/lb-orchestration-feat
 const { makeOrchestrationAuthDispatcher } = require('./lib/lb-orchestration-auth')
 const {
   makeAvailabilityHandler,
+  makeBusyHandler,
+  makeLocationsHandler,
+  makeTeamFreeWindowsHandler,
   makeBookingRequestHandler,
   makeBookingCancelHandler,
   makeHandoffHandler,
@@ -487,6 +490,7 @@ module.exports = (supabase, logger) => {
     // the caller didn't pass an explicit lbExternalRequestId, these are NULL
     // and the lead behaves like any other SF-native lead (no outbound).
     const lbLink = pickLbLink(input)
+    const lbSpend = pickLbSpend(input)
 
     const { data: newLead, error } = await supabase.from('opportunities').insert({
       user_id: userId,
@@ -504,6 +508,8 @@ module.exports = (supabase, logger) => {
       lb_channel: lbLink.lb_channel,
       lb_business_id: lbLink.lb_business_id,
       lb_provider_account_id: lbLink.lb_provider_account_id,
+      opportunity_cost: lbSpend.opportunity_cost,       // mig 082 — TT lead price in dollars, null when unknown
+      budget_voided_at: lbSpend.budget_voided_at,       // mig 082 — LB refund/void gate
     }).select().single()
 
     if (error) { logger.error('[LB Lead] Create error:', error.message); return null }
@@ -574,6 +580,7 @@ module.exports = (supabase, logger) => {
     // therefore emit to the child's externalRequestId, which is the
     // correct LB-side target for that acquisition.
     const lbLink = pickLbLink(input)
+    const lbSpend = pickLbSpend(input)
 
     const { data: newChild, error } = await supabase.from('opportunities').insert({
       user_id: userId,
@@ -592,6 +599,8 @@ module.exports = (supabase, logger) => {
       lb_channel: lbLink.lb_channel,
       lb_business_id: lbLink.lb_business_id,
       lb_provider_account_id: lbLink.lb_provider_account_id,
+      opportunity_cost: lbSpend.opportunity_cost,       // mig 082 — child acquisition = its own charge event
+      budget_voided_at: lbSpend.budget_voided_at,
     }).select().single()
 
     if (error) {
@@ -1084,6 +1093,36 @@ module.exports = (supabase, logger) => {
       }
 
       logger.log(`[LB] Connected for user ${userId}, ${accounts.length} accounts`)
+
+      // Fire-and-forget marketing-spend backfill+materialize so the operator
+      // sees populated Analytics right after Connect without clicking "Sync
+      // from LeadBridge" manually. Non-blocking — connect returns whether
+      // or not the backfill succeeds. New leads flow via webhook anyway;
+      // this only accelerates the FIRST view of historical months.
+      setImmediate(async () => {
+        try {
+          const { backfillThumbtackCost } = require('./services/tt-cost-backfill')
+          const { materializeThumbtackSpend } = require('./services/tt-spend-materializer')
+          const bf = await backfillThumbtackCost(supabase, logger, { userId, apply: true })
+          if (bf.error) {
+            logger.warn(`[LB Connect → backfill] user=${userId} skipped: ${bf.error}`)
+            return
+          }
+          // Materialize the widest reasonable range so all months light up.
+          const now = new Date()
+          const twoYearsAgo = new Date(now.getFullYear() - 2, now.getMonth(), 1)
+          const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+          await materializeThumbtackSpend(supabase, logger, {
+            userId,
+            startDate: iso(twoYearsAgo),
+            endDate: iso(now),
+          })
+          logger.log(`[LB Connect → backfill] user=${userId} complete backfill_updated=${bf.updated || 0} eligible=${bf.eligible || 0}`)
+        } catch (e) {
+          logger.warn(`[LB Connect → backfill] user=${userId} failed: ${e.message}`)
+        }
+      })
+
       res.json({
         success: true,
         accounts,
@@ -1664,6 +1703,36 @@ module.exports = (supabase, logger) => {
   // Old sync/reconcile flows are completely untouched.
   // ══════════════════════════════════════
   const orchAvailabilityHandler = makeAvailabilityHandler({ supabase, logger })
+  // Two-step scope resolver used by /orchestration/busy so LB can filter
+  // busy windows by SavedAccount (per-location). Step 1: find SF's
+  // provider_accounts row for (userId, externalBusinessId). Step 2: hand
+  // its id + optional externalLocationId to the shared
+  // resolveConversationLocation helper (defined above). Returns
+  // { locationId, resolution } — resolution string mirrors the
+  // resolveConversationLocation vocabulary plus 'unknown_business' when
+  // step 1 finds nothing.
+  const resolveLocationForOrchestrationScope = async ({ userId, externalBusinessId, externalLocationId }) => {
+    if (!externalBusinessId) return { locationId: null, resolution: 'no_business_id' }
+    const { data: pa } = await supabase
+      .from('provider_accounts')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('external_business_id', externalBusinessId)
+      .maybeSingle()
+    if (!pa) return { locationId: null, resolution: 'unknown_business' }
+    return resolveConversationLocation({
+      providerAccountId: pa.id,
+      externalLocationId: externalLocationId || null,
+      externalBusinessId,
+    })
+  }
+  const orchBusyHandler = makeBusyHandler({
+    supabase, logger, resolveLocationForOrchestrationScope,
+  })
+  const orchLocationsHandler = makeLocationsHandler({ supabase, logger })
+  const orchTeamFreeWindowsHandler = makeTeamFreeWindowsHandler({
+    supabase, logger, resolveLocationForOrchestrationScope,
+  })
   const orchBookingRequestHandler = makeBookingRequestHandler({
     supabase, logger, setCustomerAcquisitionIfMissing: _setCustomerAcquisitionIfMissing2B,
   })
@@ -1680,6 +1749,12 @@ module.exports = (supabase, logger) => {
 
   router.get('/orchestration/availability',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchAvailabilityHandler)
+  router.get('/orchestration/busy',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBusyHandler)
+  router.get('/orchestration/locations',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchLocationsHandler)
+  router.get('/orchestration/team-free-windows',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchTeamFreeWindowsHandler)
   router.post('/orchestration/booking-request',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingRequestHandler)
   router.post('/orchestration/booking-cancel',
@@ -3006,6 +3081,13 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
       const lbChannel = channel || null
       const lbBusinessId = thread.external_business_id || event.business_id || null
       const lbProviderAccountId = resolvedAccountId || null
+      // mig 082 — Thumbtack per-lead cost + LB refund/void gate. Optional
+      // fields on the LB webhook payload's `lead` object (see LB
+      // src/crm-webhooks/crm-webhook.service.ts CrmEventPayload.lead).
+      // Null-safe if LB hasn't shipped the contract extension yet.
+      const eventLead = event.lead || {}
+      const leadPriceCents = eventLead.leadPriceCents ?? eventLead.lead_price_cents ?? null
+      const budgetVoidedAt = eventLead.budgetVoidedAt ?? eventLead.budget_voided_at ?? null
 
       if (prereq.useEngine) {
         // Stage 2 engine path — identity resolution + lead-create in one call.
@@ -3023,6 +3105,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
             lbChannel,
             lbBusinessId,
             lbProviderAccountId,
+            leadPriceCents,
+            budgetVoidedAt,
           })
           identity = engineIdentity
         } catch (e) {
@@ -3040,6 +3124,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
           lbChannel,
           lbBusinessId,
           lbProviderAccountId,
+          leadPriceCents,
+          budgetVoidedAt,
         }).catch(e => logger.warn(`[LB Webhook] Lead resolution: ${e.message}`))
       }
 
@@ -3210,6 +3296,11 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
               const lbChannelVal = channel || null
               const lbBusinessId = lead.businessId || acct.external_business_id || null
               const lbProviderAccountId = acct.id || null
+              // mig 082 — spend/refund pass-through from LB's NormalizedLead.
+              // Optional. Null when LB hasn't shipped the contract extension
+              // or when the platform has no cost concept (Yelp).
+              const leadPriceCents = lead.leadPriceCents ?? lead.lead_price_cents ?? null
+              const budgetVoidedAt = lead.budgetVoidedAt ?? lead.budget_voided_at ?? null
 
               let identity = null
               if (prereq.useEngine) {
@@ -3227,6 +3318,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
                   lbChannel: lbChannelVal,
                   lbBusinessId,
                   lbProviderAccountId,
+                  leadPriceCents,
+                  budgetVoidedAt,
                 })
                 identity = engineIdentity
               } else {
@@ -3251,6 +3344,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
                     lbChannel: lbChannelVal,
                     lbBusinessId,
                     lbProviderAccountId,
+                    leadPriceCents,
+                    budgetVoidedAt,
                   })
                 }
               }

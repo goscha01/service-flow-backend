@@ -140,12 +140,25 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
   function mapTeamMember(zb, userId) {
     const nameParts = (zb.name || '').split(' ')
+    // Address extraction — ZB returns providers with the same `addresses[]`
+    // shape as customers (line1 / city / state / postal_code). Some
+    // integrations also expose a flat `address` string; try both. Falls
+    // through to null so the SF row keeps whatever was there before.
+    const addr = zb.addresses?.[0] || {}
+    const flatAddr = typeof zb.address === 'string' ? zb.address : null
     const mapped = {
       user_id: userId,
       first_name: nameParts[0] || '',
       last_name: nameParts.slice(1).join(' ') || '',
       email: zb.email || '',
       phone: zb.phone || null,
+      // Home address for routing / drive-time / ZIP-exclusion UI. The SF
+      // team_members schema uses `location` as the street/full-address
+      // column (matches how team-member-details.jsx reads it).
+      location: addr.line1 || flatAddr || null,
+      city: addr.city || zb.city || null,
+      state: addr.state || zb.state || null,
+      zip_code: addr.postal_code || zb.zip_code || null,
       zenbooker_id: zb.id,
       salary_start_date: null, // Explicit null: DB default is CURRENT_DATE which breaks payroll for historical jobs
     }
@@ -156,6 +169,20 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     const zbAvail = buildAvailabilityFromZb(zb)
     if (zbAvail) mapped.availability = zbAvail
     return mapped
+  }
+
+  // Helper for the update-existing branch of syncTeamMembers — only fills
+  // address columns that are currently NULL on the SF row so manual edits
+  // aren't clobbered. Same semantics as mapCustomer's adoption pattern.
+  function pickTeamMemberAddressFill(zb, existing) {
+    const addr = zb.addresses?.[0] || {}
+    const flatAddr = typeof zb.address === 'string' ? zb.address : null
+    const patch = {}
+    if (!existing.location && (addr.line1 || flatAddr)) patch.location = addr.line1 || flatAddr
+    if (!existing.city && (addr.city || zb.city)) patch.city = addr.city || zb.city
+    if (!existing.state && (addr.state || zb.state)) patch.state = addr.state || zb.state
+    if (!existing.zip_code && (addr.postal_code || zb.zip_code)) patch.zip_code = addr.postal_code || zb.zip_code
+    return patch
   }
 
   function mapCustomer(zb, userId) {
@@ -654,6 +681,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       statusCounts[s] = (statusCounts[s] || 0) + 1
     }
     logger.log(`[Zenbooker] /team_members raw=${zbTeamRaw.length} user_status counts=${JSON.stringify(statusCounts)}`)
+    // One-shot diagnostic: dump the first ZB team-member payload shape so
+    // we can see which fields carry the home address. Remove after the
+    // address-sync mapping is confirmed working.
+    if (zbTeamRaw[0]) {
+      const sample = zbTeamRaw[0]
+      logger.log(`[Zenbooker][DBG] team_member sample keys=[${Object.keys(sample).join(',')}]`)
+      logger.log(`[Zenbooker][DBG] team_member sample payload: ${JSON.stringify(sample).slice(0, 800)}`)
+    }
     const zbTeam = zbTeamRaw.filter(zb =>
       !INACTIVE_ZB_STATUSES.has(String(zb?.user_status ?? '').toLowerCase())
     )
@@ -668,7 +703,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     for (const zb of zbTeam) {
       if (!zb || !zb.id) continue
       seenZbIds.add(String(zb.id))
-      const { data: existing } = await supabase.from('team_members').select('id, status, availability').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+      const { data: existing } = await supabase.from('team_members').select('id, status, availability, location, city, state, zip_code').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
       if (existing) {
         skipped++
         // Defensive: refresh the outbound mapping registry for already-known
@@ -701,6 +736,21 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             logger.warn(`[Zenbooker] Availability update failed for team_member ${existing.id}: ${availErr.message}`)
           } else {
             availabilityUpdated++
+          }
+        }
+        // Address fill — populate SF columns from ZB ONLY when SF's value
+        // is currently NULL. Preserves any manual edits an operator made
+        // on the SF side (matches the customer-adoption pattern).
+        const addrPatch = pickTeamMemberAddressFill(zb, existing)
+        if (Object.keys(addrPatch).length > 0) {
+          addrPatch.updated_at = new Date().toISOString()
+          const { error: addrErr } = await supabase.from('team_members')
+            .update(addrPatch)
+            .eq('id', existing.id)
+          if (addrErr) {
+            logger.warn(`[Zenbooker] Address fill failed for team_member ${existing.id}: ${addrErr.message}`)
+          } else {
+            logger.log(`[Zenbooker] Filled ${Object.keys(addrPatch).filter(k=>k!=='updated_at').join(',')} from ZB for team_member ${existing.id}`)
           }
         }
         continue

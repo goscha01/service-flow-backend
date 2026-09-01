@@ -49,10 +49,14 @@ const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 const { startReconcileCron: startZbFutureReconcileCron } = require('./workers/zb-future-reconcile-cron');
-const { startAvailabilityReconcileCron: startZbAvailabilityReconcileCron } = require('./workers/zb-availability-reconcile-cron');
+const {
+  startAvailabilityReconcileCron: startZbAvailabilityReconcileCron,
+} = require('./workers/zb-availability-reconcile-cron');
+const { syncAvailabilityFromZenbooker: syncAvailabilityOnlyFromZb } = require('./lib/zenbooker-availability-only-sync');
 const { updateJobStatus: jobStatusServiceUpdate } = require('./services/job-status-service');
 const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
 const { startDrainer: startLbOrchestrationWebhookDrainer } = require('./workers/lb-orchestration-webhook-drainer');
+const { start: startMarketingSpendMaterializeCron } = require('./workers/marketing-spend-materialize-cron');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const identityGraphViolation = require('./lib/identity-graph-violation');
@@ -1115,6 +1119,9 @@ let jobNotifications = null; try { jobNotifications = require('./job-notificatio
 try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, notificationEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
 let jobExpenseRouter = null;
 try { jobExpenseRouter = require('./job-expense-service')(supabase, logger); app.use('/api', jobExpenseRouter); } catch (e) { console.log('Job expense module not loaded:', e.message); }
+let businessExpenseModule = null;
+try { businessExpenseModule = require('./business-expense-service'); app.use('/api/business-expenses', businessExpenseModule(supabase, logger)); } catch (e) { console.log('Business expense module not loaded:', e.message); }
+try { app.use('/api/marketing-spend', require('./marketing-spend-service')(supabase, logger)); } catch (e) { console.log('Marketing spend module not loaded:', e.message); }
 
 // Connected Email (Gmail/Outlook OAuth) — System 2 for Communications Hub.
 // Loosely coupled: removing this block + services/connected-email/ = feature gone, zero side effects.
@@ -1257,6 +1264,24 @@ const validateName = (name) => {
 const sanitizeInput = (input) => {
   if (typeof input !== 'string') return input;
   return validator.escape(input.trim());
+};
+
+// Normalize a client-provided ZIP-exclusion list to a jsonb-safe array
+// of 5-digit strings. Drops empties, ZIP+4 suffixes are collapsed to
+// the 5-digit prefix, dedupes, ignores garbage. Returns []; callers
+// can use `?? undefined` if they want to skip the column on update.
+const sanitizeZipExclusions = (input) => {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of input) {
+    const z = String(raw || '').trim().replace(/-.*$/, '');
+    if (!/^\d{5}$/.test(z)) continue;
+    if (seen.has(z)) continue;
+    seen.add(z);
+    out.push(z);
+  }
+  return out;
 };
 
 // Calculate distance between two points using Haversine formula
@@ -4319,9 +4344,21 @@ async function checkSchedulingRules(serviceId, dateStr) {
   }
 }
 
+// Extract a 5-digit ZIP from a free-form US address string. Returns
+// null if none found. Used by the availability engine so callers can
+// keep passing `customerAddress` and still get ZIP-exclusion
+// enforcement without a schema change to their call.
+function extractZipFromAddress(addr) {
+  if (!addr) return null;
+  const m = String(addr).match(/\b(\d{5})(?:-\d{4})?\b/);
+  return m ? m[1] : null;
+}
+
 // Main shared slot generation function
 // customerAddress (optional, Phase 3.1): customer's address for location-based driving time
-async function generateAvailableSlots({ userId, dateStr, durationMinutes, serviceId, workerId, customerAddress }) {
+// customerZip (optional): if omitted, extracted from customerAddress. Members whose
+//   `zip_exclusions` contains this ZIP are hard-blocked from the slot output.
+async function generateAvailableSlots({ userId, dateStr, durationMinutes, serviceId, workerId, customerAddress, customerZip }) {
   const requestedDate = new Date(dateStr + 'T12:00:00');
   if (isNaN(requestedDate.getTime())) {
     return { error: 'Invalid date format', slots: [] };
@@ -4377,10 +4414,10 @@ async function generateAvailableSlots({ userId, dateStr, durationMinutes, servic
     ? await getPerJobDrivingTimes(existingJobs || [], customerAddress, drivingTimeMinutes)
     : null;
 
-  // 5) Fetch team members
+  // 5) Fetch team members (include zip_exclusions for the ZIP-exclusion filter below)
   let tmQuery = supabase
     .from('team_members')
-    .select('id, first_name, last_name, availability, skills')
+    .select('id, first_name, last_name, availability, skills, zip_exclusions')
     .eq('user_id', userId)
     .eq('status', 'active');
   if (workerId) tmQuery = tmQuery.eq('id', workerId);
@@ -4398,6 +4435,18 @@ async function generateAvailableSlots({ userId, dateStr, durationMinutes, servic
       const workerSkills = w.skills || [];
       const skillsArr = Array.isArray(workerSkills) ? workerSkills : [];
       return config.skillsRequired.every(s => skillsArr.includes(s));
+    });
+  }
+
+  // 6b) ZIP-exclusion hard block. If we know the destination ZIP (from
+  // an explicit arg or extractable from customerAddress), drop any
+  // member whose zip_exclusions contains it. Members with empty/null
+  // exclusion lists pass through unchanged.
+  const resolvedZip = customerZip || extractZipFromAddress(customerAddress);
+  if (resolvedZip) {
+    eligibleWorkers = eligibleWorkers.filter(w => {
+      const excl = Array.isArray(w.zip_exclusions) ? w.zip_exclusions : [];
+      return !excl.map(String).includes(String(resolvedZip));
     });
   }
 
@@ -4580,7 +4629,7 @@ async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, 
 app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { date, duration = 120, workerId, serviceId, customerAddress } = req.query;
+    const { date, duration = 120, workerId, serviceId, customerAddress, customerZip } = req.query;
 
     if (!date) {
       return res.status(400).json({ error: 'Date parameter is required' });
@@ -4593,7 +4642,8 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
       durationMinutes,
       serviceId: serviceId || null,
       workerId: workerId || null,
-      customerAddress: customerAddress || null
+      customerAddress: customerAddress || null,
+      customerZip: customerZip || null
     });
 
     if (result.error) {
@@ -5420,6 +5470,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         user_id: userId,
         customer_id: customerId,
         service_address_city: serviceAddress && serviceAddress.city,
+        service_address_zip: serviceAddress && serviceAddress.zipCode,
         currentTerritory: territory,
         logger,
       });
@@ -5432,6 +5483,35 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       logger.log(`[Territory resolver] sf_job_create user_id=${userId} customer_id=${customerId} confidence=${tr.confidence} source=${tr.source} territory=${tr.territory == null ? 'null' : tr.territory}`);
     } catch (terrErr) {
       logger.warn(`[Territory resolver] failed (non-blocking): ${terrErr && terrErr.message}`);
+    }
+
+    // ZIP-exclusion soft warning. Manual assignment is allowed; we
+    // surface a bookingWarnings entry so the operator sees "This
+    // cleaner is normally excluded from ZIP X" and can decide. The
+    // availability engine already hard-blocks these members from
+    // auto-suggestions — this branch fires when the operator picks
+    // a specific member manually.
+    try {
+      const zip = serviceAddress && serviceAddress.zipCode ? String(serviceAddress.zipCode).trim() : null;
+      const assignedIds = [];
+      if (teamMemberId != null) assignedIds.push(teamMemberId);
+      const bodyMulti = Array.isArray(req.body.teamMemberIds) ? req.body.teamMemberIds : [];
+      for (const id of bodyMulti) if (id != null && !assignedIds.includes(id)) assignedIds.push(id);
+      if (zip && assignedIds.length > 0) {
+        const { data: exclChecks } = await supabase
+          .from('team_members')
+          .select('id, first_name, last_name, zip_exclusions')
+          .in('id', assignedIds);
+        for (const m of exclChecks || []) {
+          const excl = Array.isArray(m.zip_exclusions) ? m.zip_exclusions.map(String) : [];
+          if (excl.includes(zip)) {
+            const name = `${m.first_name || ''} ${m.last_name || ''}`.trim() || `#${m.id}`;
+            bookingWarnings.push(`ZIP ${zip} is on ${name}'s excluded list — they normally aren't routed to this ZIP. Assignment allowed; verify with them if needed.`);
+          }
+        }
+      }
+    } catch (exclErr) {
+      logger.warn(`[ZIP-exclusion warn] failed (non-blocking): ${exclErr && exclErr.message}`);
     }
 
     // Process modifiers and intake questions to calculate final price and duration
@@ -18494,7 +18574,7 @@ app.get('/api/public/services', async (req, res) => {
 
 app.get('/api/public/availability', async (req, res) => {
   try {
-    const { userId = 1, date, serviceId, duration = 120, customerAddress } = req.query;
+    const { userId = 1, date, serviceId, duration = 120, customerAddress, customerZip } = req.query;
 
     if (!date) {
       return res.status(400).json({ error: 'Date is required (YYYY-MM-DD)' });
@@ -18507,7 +18587,8 @@ app.get('/api/public/availability', async (req, res) => {
       durationMinutes,
       serviceId: serviceId || null,
       workerId: null,
-      customerAddress: customerAddress || null
+      customerAddress: customerAddress || null,
+      customerZip: customerZip || null
     });
 
     if (result.error) {
@@ -20868,106 +20949,79 @@ app.delete('/api/territories/:id', authenticateToken, async (req, res) => {
 });
 
 // Territory detection based on customer location
-app.post('/api/territories/detect', async (req, res) => {
+// Territory preview / detection.
+//
+// Runs `resolveTerritory` (see lib/territory-resolver.js) against a
+// candidate address so the frontend can prefill the territory chip on
+// customer- or job-create BEFORE the row is written. When the resolver
+// returns confidence 'ambiguous' or 'no_match', we also include the
+// active-territory list as `alternatives` so the UI can open a manual
+// picker.
+async function handleTerritoryPreview(req, res) {
   try {
-    const { userId, customerAddress, customerZipCode } = req.body;
-    
-    if (!userId || (!customerAddress && !customerZipCode)) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    const b = req.body || {};
+    const userId = b.userId != null ? b.userId : b.user_id;
+    const zipCode = b.zipCode != null ? b.zipCode : (b.customerZipCode != null ? b.customerZipCode : b.zip);
+    const city = b.city != null ? b.city : b.customerCity;
+    const customerId = b.customerId != null ? b.customerId : b.customer_id;
+
+    if (!userId || (!zipCode && !city)) {
+      return res.status(400).json({ error: 'userId and one of {zipCode, city} are required' });
     }
-    
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get all active territories for the user
-      const [territories] = await connection.query(`
-        SELECT * FROM territories 
-        WHERE user_id = ? AND status = 'active'
-      `, [userId]);
-      
-      let matchedTerritory = null;
-      
-      for (const territory of territories) {
-        const territoryZipCodes = JSON.parse(territory.zip_codes || '[]');
-        const territoryRadius = territory.radius_miles || 25;
-        
-        // Check if customer ZIP code matches territory ZIP codes
-        if (customerZipCode && territoryZipCodes.includes(customerZipCode)) {
-          matchedTerritory = territory;
-          break;
-        }
-        
-        // Check if customer address is within territory radius
-        if (customerAddress && territoryRadius > 0 && process.env.GOOGLE_MAPS_API_KEY) {
-          try {
-            // Get coordinates for customer address
-            const customerGeocodeResponse = await axios.get(
-              `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(customerAddress)}&key=${process.env.GOOGLE_MAPS_API_KEY}`
-            )
 
-            if (customerGeocodeResponse.status !== 200) {
-              console.warn('Google Maps API request failed for customer address');
-              continue;
-            }
+    const { resolveTerritory } = require('./lib/territory-resolver');
+    const tr = await resolveTerritory(supabase, {
+      user_id: userId,
+      customer_id: customerId,
+      service_address_zip: zipCode,
+      service_address_city: city,
+    });
 
-            const customerGeocodeData = customerGeocodeResponse.data
-            
-            if (customerGeocodeData.results && customerGeocodeData.results.length > 0) {
-              const customerCoords = customerGeocodeData.results[0].geometry.location
-              
-              // Get coordinates for territory center (using location field)
-              const territoryGeocodeResponse = await axios.get(
-                `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(territory.location)}&key=${process.env.GOOGLE_MAPS_API_KEY}`
-              )
-
-              if (territoryGeocodeResponse.status !== 200) {
-                console.warn('Google Maps API request failed for territory location');
-                continue;
-              }
-
-              const territoryGeocodeData = territoryGeocodeResponse.data
-              
-              if (territoryGeocodeData.results && territoryGeocodeData.results.length > 0) {
-                const territoryCoords = territoryGeocodeData.results[0].geometry.location
-                
-                // Calculate distance between points
-                const distance = calculateDistance(
-                  customerCoords.lat, customerCoords.lng,
-                  territoryCoords.lat, territoryCoords.lng
-                )
-                
-                if (distance <= territoryRadius) {
-                  matchedTerritory = territory
-                  break
-                }
-              }
-            }
-          } catch (error) {
-            console.error('Error in geocoding:', error)
-            // Continue to next territory if geocoding fails
-          }
-        }
-      }
-      
-      if (matchedTerritory) {
-        matchedTerritory.zip_codes = JSON.parse(matchedTerritory.zip_codes || '[]');
-        matchedTerritory.business_hours = JSON.parse(matchedTerritory.business_hours || '{}');
-        matchedTerritory.team_members = JSON.parse(matchedTerritory.team_members || '[]');
-        matchedTerritory.services = JSON.parse(matchedTerritory.services || '[]');
-      }
-      
-      res.json({
-        territory: matchedTerritory,
-        available: !!matchedTerritory
-      });
-    } finally {
-      connection.release();
+    let territoryId = null;
+    let alternatives = [];
+    if (tr.territory) {
+      // Look up the id for the resolved name so the frontend can bind
+      // both `territory` (name) and `territoryId` (fk) without a second
+      // round-trip.
+      const { data: match } = await supabase
+        .from('territories')
+        .select('id, name, location')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .eq('name', tr.territory)
+        .limit(1);
+      if (match && match[0]) territoryId = match[0].id;
     }
+    if (tr.confidence === 'ambiguous' || tr.confidence === 'no_match') {
+      const { data: all } = await supabase
+        .from('territories')
+        .select('id, name, location, zip_codes')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .order('name');
+      alternatives = all || [];
+    }
+
+    return res.json({
+      territory: tr.territory,
+      territoryId,
+      confidence: tr.confidence,
+      warning: tr.warning,
+      source: tr.source,
+      alternatives,
+      available: !!tr.territory,
+    });
   } catch (error) {
-    console.error('Territory detection error:', error);
-    res.status(500).json({ error: 'Failed to detect territory' });
+    console.error('Territory preview error:', error);
+    return res.status(500).json({ error: 'Failed to preview territory' });
   }
-});
+}
+
+app.post('/api/territories/preview', handleTerritoryPreview);
+// Legacy alias — `/detect` predates `/preview` and previously ran a
+// broken MySQL query; kept as a thin forward so any lingering callers
+// (see api.js#territoriesAPI.detectTerritory) still get sensible data.
+app.post('/api/territories/detect', handleTerritoryPreview);
 
 // Get available team members for a territory - DISABLED (MySQL not configured)
 // app.get('/api/territories/:id/team-members', async (req, res) => {
@@ -23490,9 +23544,10 @@ app.post('/api/team-members', async (req, res) => {
       state,
       zipCode,
       territories,
-      permissions
+      permissions,
+      zipExclusions
     } = req.body;
-    
+
     // Validate required fields - firstName and lastName are optional
     if (!userId || !email || !username || !password) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -23658,6 +23713,7 @@ app.post('/api/team-members', async (req, res) => {
         zip_code: zipCode || null,
         territories,
         permissions,
+        zip_exclusions: sanitizeZipExclusions(zipExclusions),
         ...(await checkColorColumn() ? { color: randomColor } : {}),
         status: 'invited',
         invitation_token: invitationToken,
@@ -23755,7 +23811,9 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       hourly_rate, // Support snake_case from frontend
       commission_percentage, // Support snake_case from frontend
       salaryStartDate,
-      salary_start_date
+      salary_start_date,
+      zipExclusions,
+      zip_exclusions
     } = req.body;
     
     // Normalize field names (support both camelCase and snake_case)
@@ -24022,7 +24080,14 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
     if (territories !== undefined) {
       dataToSave.territories = typeof territories === 'string' ? territories : JSON.stringify(territories);
     }
-    
+
+    // Accept zipExclusions (camelCase) or zip_exclusions (snake_case).
+    // undefined = don't touch; [] explicitly clears the exclusion list.
+    const zipExclusionsInput = zipExclusions !== undefined ? zipExclusions : zip_exclusions;
+    if (zipExclusionsInput !== undefined) {
+      dataToSave.zip_exclusions = sanitizeZipExclusions(zipExclusionsInput);
+    }
+
     if (permissions !== undefined) {
       // Ensure permissions is stored as JSON string if it's an object
       if (typeof permissions === 'object' && permissions !== null) {
@@ -27207,6 +27272,341 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
   }
 });
 
+// ==================== ZB Availability Sync (on-demand) ====================
+//
+// Pulls Zenbooker /team_members (recurring_hours + date_overrides) for the
+// caller's tenant and rewrites team_members.availability via
+// buildAvailabilityFromZb. Same mapping the full ZB sync uses, isolated to
+// availability so it's cheap enough for an on-demand button.
+//
+// Off-days in ZB (date_override with hours: []) are recorded as
+// customAvailability { available: false, source: 'zenbooker' } — the older
+// /timeslots reconciler could not represent those and silently dropped
+// them, which is why "Alina has 18-19 off in ZB but SF shows available"
+// slipped through the earlier sync.
+//
+// Runs in the background (setImmediate); client polls /progress until
+// status === 'done'.
+
+// ══════════════════════════════════════════════════════════════════════
+// Expenses analytics — thin summary endpoints for the Expenses tab.
+// Job-level reimbursements come from job_expenses (mig 013). Recurring
+// overhead comes from business_expenses (mig 081). Payroll is fetched
+// separately via /api/analytics/salary. Marketing/ad spend comes from
+// marketing_spend (mig 082) via lib/marketing-spend-aggregation.
+// ══════════════════════════════════════════════════════════════════════
+
+// GET /api/analytics/ads-spend?startDate&endDate
+//
+// Canonical marketing-spend read path. Reads ONLY from marketing_spend
+// (per-source per-month rows). Thumbtack rows are materialized from
+// opportunities.opportunity_cost via services/tt-spend-materializer.js;
+// Yelp/Google/Meta/LSA rows are manual or upstream-imported.
+//
+// Unknown spend is NOT $0 — sources with no marketing_spend rows return
+// null values (frontend renders as em-dash).
+//
+// Response envelope preserved for frontend compat with the previous
+// stub; the shape is stable across the mig 082 cutover.
+app.get('/api/analytics/ads-spend', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, locationId } = req.query;
+    const { getAdsSpendReport, getEffectiveSpend, rollupByMonth } = require('./lib/marketing-spend-aggregation');
+
+    // Period-scoped totals + per-source rollup (respect the period selector).
+    const report = await getAdsSpendReport(supabase, { userId, startDate, endDate, locationId });
+
+    // Envelope contract: numbers in dollars for the frontend (existing UI
+    // reads .spend as dollars). Cents live at the DB/aggregation layer;
+    // this is the boundary conversion.
+    const bySource = report.bySource.map((r) => ({
+      source: r.source,
+      spend: r.spendCents / 100,
+      reportedSpend: r.reportedSpendCents != null ? r.reportedSpendCents / 100 : null,
+      count: r.leadCount,
+      cpl: r.cplCents != null ? r.cplCents / 100 : null,
+      months: r.months,
+      isManualOverride: r.isManualOverride,
+      sourceTypes: r.sourceTypes,
+    }));
+
+    // 12-month trend chart is a HISTORICAL view — independent of the
+    // period selector. Always fetches the last 12 months of spend so the
+    // chart is meaningful regardless of whether the user picked 7d / 30d / YTD.
+    const anchor = endDate ? new Date(endDate) : new Date();
+    const historyEnd = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0);   // last day of anchor month
+    const historyStart = new Date(anchor.getFullYear(), anchor.getMonth() - 11, 1); // first day of 12mo-ago month
+    const historyStartStr = historyStart.toISOString().slice(0, 10);
+    const historyEndStr = historyEnd.toISOString().slice(0, 10);
+
+    const historyRows = await getEffectiveSpend(supabase, {
+      userId, startDate: historyStartStr, endDate: historyEndStr, locationId,
+    });
+    const historyMonthly = rollupByMonth(historyRows);
+    console.log(`[ads-spend] user=${userId} location=${locationId || 'all'} history_range=${historyStartStr}..${historyEndStr} rows=${historyRows.length} monthly=${historyMonthly.length} sample=${JSON.stringify(historyRows.slice(0, 3).map(r => ({s: r.source, ps: r.periodStart, cents: r.amountCents, acct: r.externalAccountId})))}`);
+
+    const monthly = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(anchor.getFullYear(), anchor.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      monthly.push({
+        key,
+        label: d.toLocaleString('en-US', { month: 'short' }),
+        spend: 0,
+        count: 0,
+      });
+    }
+    for (const m of historyMonthly) {
+      const row = monthly.find((x) => x.key === m.monthKey);
+      if (row) row.spend += m.amountCents / 100;
+    }
+
+    res.json({
+      summary: {
+        totalSpend: report.summary.totalSpendCents / 100,
+        opportunityCount: report.summary.opportunityCount,
+        avgCostPerLead: report.summary.avgCplCents != null ? report.summary.avgCplCents / 100 : null,
+      },
+      bySource,
+      monthly,
+    });
+  } catch (e) {
+    console.error('ads-spend failed:', e?.message || e, e?.stack);
+    res.status(500).json({ error: 'Failed to compute ads spend', detail: e?.message });
+  }
+});
+
+// POST /api/marketing-spend/backfill/thumbtack
+// Body: { startDate?, endDate?, apply?: false, materialize?: true }
+// Pulls LB /v1/leads?scope=all&platform=thumbtack via the tenant's LB token,
+// fills opportunities.opportunity_cost (fill-only) + budget_voided_at (refresh),
+// and optionally runs the monthly materializer.
+// Default is dry-run — reports counters without writing.
+app.post('/api/marketing-spend/backfill/thumbtack', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, apply = false, materialize = true } = req.body || {};
+    const { backfillThumbtackCost } = require('./services/tt-cost-backfill');
+    const backfillResult = await backfillThumbtackCost(supabase, logger, {
+      userId, startDate, endDate, apply: !!apply,
+    });
+
+    if (backfillResult.error) {
+      return res.status(400).json({ error: backfillResult.error, message: backfillResult.message });
+    }
+
+    // Optionally materialize monthly rows on the same range.
+    let materializeResult = null;
+    if (apply && materialize) {
+      const { materializeThumbtackSpend } = require('./services/tt-spend-materializer');
+      // Default range for materializer: fall back to opportunities table span
+      // if no explicit range was passed to the backfill.
+      let matStart = startDate;
+      let matEnd = endDate;
+      if (!matStart || !matEnd) {
+        const { data: bounds } = await supabase
+          .from('opportunities')
+          .select('created_at')
+          .eq('user_id', userId)
+          .not('lb_external_request_id', 'is', null)
+          .order('created_at', { ascending: true })
+          .limit(1);
+        if (bounds && bounds[0]) matStart = matStart || bounds[0].created_at.slice(0, 10);
+        matEnd = matEnd || new Date().toISOString().slice(0, 10);
+      }
+      if (matStart && matEnd) {
+        materializeResult = await materializeThumbtackSpend(supabase, logger, {
+          userId, startDate: matStart, endDate: matEnd,
+        });
+      }
+    }
+
+    res.json({ backfill: backfillResult, materialize: materializeResult });
+  } catch (e) {
+    console.error('backfill thumbtack failed:', e);
+    res.status(500).json({ error: e.message || 'Failed to backfill Thumbtack cost' });
+  }
+});
+
+// POST /api/marketing-spend/materialize/thumbtack
+// Body: { startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD', splitByAccount?: false }
+// Recomputes derived TT rows for the range. Idempotent, respects manual overrides.
+// Called by the Expenses UI's "Sync Thumbtack" button and by the historical
+// backfill script after opportunity_cost has been populated.
+app.post('/api/marketing-spend/materialize/thumbtack', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, splitByAccount } = req.body || {};
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'startDate and endDate are required (YYYY-MM-DD)' });
+    }
+    const { materializeThumbtackSpend } = require('./services/tt-spend-materializer');
+    const result = await materializeThumbtackSpend(supabase, logger, {
+      userId, startDate, endDate,
+      splitByAccount: !!splitByAccount,
+    });
+    res.json(result);
+  } catch (e) {
+    console.error('materialize thumbtack failed:', e);
+    res.status(500).json({ error: e.message || 'Failed to materialize Thumbtack spend' });
+  }
+});
+
+// GET /api/analytics/expenses-summary?startDate&endDate
+// Combines:
+//   - job_expenses (approved, reimbursable, per-job) — flows through payroll
+//     but is surfaced here as its own expense line so the operator can see
+//     "how much are cleaner reimbursements costing me"
+//   - business_expenses (rent, SaaS, insurance, etc.) — expanded per cadence
+//     inside the date range, not persisted per-occurrence.
+app.get('/api/analytics/expenses-summary', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate } = req.query;
+
+    // Default range = last 30 days if omitted
+    const end = endDate ? new Date(endDate) : new Date();
+    const start = startDate ? new Date(startDate) : new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const startStr = start.toISOString().split('T')[0];
+    const endStr = end.toISOString().split('T')[0];
+
+    // — job_expenses: approved & company-paid or reimbursable-to-member.
+    // These are the operator's actual cash outflow for jobs.
+    let jobExpQ = supabase
+      .from('job_expenses')
+      .select('id, amount, paid_by, reimbursable_to_team_member, expense_type, status, created_at, job_id, jobs(scheduled_date)')
+      .eq('user_id', userId)
+      .eq('status', 'approved');
+    const { data: jobExpRows, error: jobExpErr } = await jobExpQ;
+    if (jobExpErr) throw jobExpErr;
+
+    const isOperatorCost = (e) => {
+      // Operator pays when: company paid it, OR team_member paid it AND we owe reimbursement.
+      // Deductions are money coming back FROM team member (not a cost). Customer-paid = no cost to us.
+      if (e.paid_by === 'company') return true;
+      if (e.paid_by === 'team_member' && e.reimbursable_to_team_member) return true;
+      return false;
+    };
+    const inRange = (dateStr) => {
+      if (!dateStr) return false;
+      const d = String(dateStr).split('T')[0].split(' ')[0];
+      return d >= startStr && d <= endStr;
+    };
+    const attributedDate = (row) =>
+      (row.jobs?.scheduled_date && String(row.jobs.scheduled_date).split('T')[0].split(' ')[0]) ||
+      (row.created_at && String(row.created_at).split('T')[0]);
+
+    const jobExpensesInRange = (jobExpRows || []).filter(r => isOperatorCost(r) && inRange(attributedDate(r)));
+    const jobExpensesTotal = jobExpensesInRange.reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+
+    const jobExpensesByType = {};
+    jobExpensesInRange.forEach(r => {
+      const k = r.expense_type || 'other';
+      jobExpensesByType[k] = (jobExpensesByType[k] || 0) + (parseFloat(r.amount) || 0);
+    });
+
+    // — business_expenses: expand each row's cadence inside the range
+    const businessSvc = businessExpenseModule;
+    const { data: bizRows, error: bizErr } = await supabase
+      .from('business_expenses')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('is_active', true);
+    if (bizErr) throw bizErr;
+
+    const businessExpanded = (bizRows || []).map(exp => {
+      const occurrences = businessSvc?.occurrencesInRange
+        ? businessSvc.occurrencesInRange(exp, start, end)
+        : 0;
+      const rangeAmount = occurrences * (parseFloat(exp.amount) || 0);
+      return { ...exp, occurrences, rangeAmount };
+    }).filter(x => x.occurrences > 0);
+
+    const businessTotal = businessExpanded.reduce((s, r) => s + r.rangeAmount, 0);
+
+    const businessByCategory = {};
+    businessExpanded.forEach(r => {
+      const k = r.category || 'other';
+      businessByCategory[k] = (businessByCategory[k] || 0) + r.rangeAmount;
+    });
+
+    res.json({
+      summary: {
+        jobExpensesTotal: Math.round(jobExpensesTotal * 100) / 100,
+        jobExpensesCount: jobExpensesInRange.length,
+        businessExpensesTotal: Math.round(businessTotal * 100) / 100,
+        businessExpensesCount: businessExpanded.length,
+        combinedTotal: Math.round((jobExpensesTotal + businessTotal) * 100) / 100,
+      },
+      jobExpensesByType,
+      businessByCategory,
+      businessExpanded: businessExpanded.map(x => ({
+        id: x.id, name: x.name, category: x.category, cadence: x.cadence,
+        amount: parseFloat(x.amount) || 0, occurrences: x.occurrences, rangeAmount: x.rangeAmount,
+      })),
+    });
+  } catch (e) {
+    console.error('expenses-summary failed:', e);
+    res.status(500).json({ error: 'Failed to compute expenses summary' });
+  }
+});
+
+const teamAvailabilitySyncProgress = {}; // userId → { status, startedAt, summary, error }
+
+app.post('/api/team-availability/sync', authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  const key = String(userId);
+  if (teamAvailabilitySyncProgress[key]?.status === 'running') {
+    return res.status(409).json({ error: 'sync already running', progress: teamAvailabilitySyncProgress[key] });
+  }
+
+  const { data: user, error: userErr } = await supabase
+    .from('users')
+    .select('zenbooker_api_key, zenbooker_status')
+    .eq('id', userId)
+    .maybeSingle();
+  if (userErr) {
+    return res.status(500).json({ error: 'user query failed', detail: userErr.message });
+  }
+  if (!user?.zenbooker_api_key || user.zenbooker_status !== 'connected') {
+    return res.status(400).json({ error: 'Zenbooker not connected for this account' });
+  }
+
+  const progress = { status: 'running', startedAt: Date.now() };
+  teamAvailabilitySyncProgress[key] = progress;
+
+  setImmediate(async () => {
+    try {
+      const { summary, failed, reason } = await syncAvailabilityOnlyFromZb({
+        supabase,
+        userId,
+        apiKey: user.zenbooker_api_key,
+        logger,
+      });
+      if (failed) {
+        progress.status = 'error';
+        progress.error = reason || 'sync failed — see server logs';
+      } else {
+        progress.status = 'done';
+        progress.summary = summary;
+        progress.finishedAt = Date.now();
+      }
+    } catch (e) {
+      progress.status = 'error';
+      progress.error = e.message || String(e);
+      logger.error('[TeamAvailabilitySync] userId=' + userId + ' failed: ' + (e.message || e));
+    }
+  });
+
+  res.status(202).json({ started: true, progress });
+});
+
+app.get('/api/team-availability/sync/progress', authenticateToken, (req, res) => {
+  const key = String(req.user.userId);
+  res.json(teamAvailabilitySyncProgress[key] || { status: 'idle' });
+});
+
 // ==================== Staff Location Tracking Endpoints ====================
 
 // Record staff location (POST /api/staff-locations)
@@ -28710,7 +29110,7 @@ app.get('/api/public/services/:userId', async (req, res) => {
 app.get('/api/public/availability/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { date, serviceId, duration = 120, customerAddress } = req.query;
+    const { date, serviceId, duration = 120, customerAddress, customerZip } = req.query;
 
     if (!date) {
       return res.status(400).json({ error: 'Date is required (YYYY-MM-DD)' });
@@ -28723,7 +29123,8 @@ app.get('/api/public/availability/:userId', async (req, res) => {
       durationMinutes,
       serviceId: serviceId || null,
       workerId: null,
-      customerAddress: customerAddress || null
+      customerAddress: customerAddress || null,
+      customerZip: customerZip || null
     });
 
     if (result.error) {
@@ -32407,7 +32808,9 @@ app.get('/api/customers/:customerId/files', authenticateToken, async (req, res) 
 
     const { data: files, error } = await supabase
       .from('customer_files')
-      .select('id, customer_id, job_id, filename, file_url, mime_type, size_bytes, uploaded_by, uploaded_at')
+      // source + proofpix_metadata so the Files tab can badge ProofPix
+      // rows and show captured_by (same fields as GET /jobs/:id/files).
+      .select('id, customer_id, job_id, filename, file_url, mime_type, size_bytes, uploaded_by, uploaded_at, source, proofpix_metadata')
       .eq('customer_id', customerId)
       .is('deleted_at', null)
       .order('uploaded_at', { ascending: false })
@@ -38656,6 +39059,18 @@ app.listen(PORT, async () => {
     logger.error(`[ZBAvailabilityReconcileCron] Failed to start: ${e.message}`);
   }
 
+  // Marketing spend materialization cron. Nightly re-materializes the last
+  // 3 months of Thumbtack marketing_spend rows from opportunities.opportunity_cost
+  // so operators don't have to click "Sync from LeadBridge" to see fresh
+  // monthly totals. New TT leads with cost land via LB webhook in real time;
+  // this cron only needs to keep the monthly rollup fresh. Gated by
+  // MARKETING_SPEND_MATERIALIZE_ENABLED. See workers/marketing-spend-materialize-cron.js.
+  try {
+    startMarketingSpendMaterializeCron(supabase, logger);
+  } catch (e) {
+    logger.error(`[MarketingSpendMaterializeCron] Failed to start: ${e.message}`);
+  }
+
   // S4 — Orchestration webhook outbox drainer.
   // Delivers connection.connected / credential.rotated / connection.revoked
   // events to the tenant's webhook URL, signed with the per-tenant
@@ -40408,9 +40823,17 @@ app.post('/api/ledger/cash-to-company', authenticateToken, async (req, res) => {
 // (Constitution §3.1), so a later cancel cannot claw it back — operator owns
 // that risk.
 async function completeScheduledJobsForMemberInPeriod(userId, teamMemberId, periodStart, periodEnd) {
-  const earningsStatuses = new Set(['completed', 'complete', 'paid']);
-  // Find candidate jobs in the window assigned to this member by EITHER
-  // the legacy direct column OR the join table.
+  // Only forward-in-progress statuses convert to completed here. Cancelled /
+  // rescheduled / no-show explicitly excluded — flipping them to completed
+  // resurrects work that didn't happen and creates a phantom earning row
+  // (see job 142070: cancelled 2026-06-20 → payout batch flipped back to
+  // completed → $95.40 phantom already-batched earning).
+  const PROJECTABLE_STATUSES = new Set([
+    'scheduled', 'pending', 'confirmed',
+    'in-progress', 'in_progress',
+    'en-route', 'en_route',
+    'started', 'late',
+  ]);
   const memberIdInt = parseInt(teamMemberId);
 
   // a) Direct assignment via jobs.team_member_id
@@ -40432,11 +40855,11 @@ async function completeScheduledJobsForMemberInPeriod(userId, teamMemberId, peri
     .lte('jobs.scheduled_date', `${periodEnd} 23:59:59`);
   const joinJobs = (joinRows || []).map(r => r.jobs).filter(Boolean);
 
-  // Dedupe by id and keep only non-earnings statuses
+  // Dedupe by id and keep only projectable statuses
   const byId = new Map();
   [...(directJobs || []), ...joinJobs].forEach(j => {
     if (!j || !j.id) return;
-    if (earningsStatuses.has((j.status || '').toLowerCase())) return;
+    if (!PROJECTABLE_STATUSES.has((j.status || '').toLowerCase())) return;
     byId.set(j.id, j);
   });
   const candidates = Array.from(byId.values());
